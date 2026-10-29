@@ -1,0 +1,580 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Moma-bis — Portail Intranet, Recherche Fédérée, OneBox, Teams &amp; go/links</title>
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+  <!-- Top Enterprise Navigation Bar (Moma Header) -->
+  <header class="moma-header">
+    <div class="moma-header-left">
+      <button type="button" id="brandHomeBtn" class="moma-brand" title="Retour à l'accueil Moma-bis">
+        <span class="moma-logo-dots" aria-hidden="true">
+          <span class="dot dot-blue"></span>
+          <span class="dot dot-red"></span>
+          <span class="dot dot-yellow"></span>
+          <span class="dot dot-green"></span>
+        </span>
+        <span class="moma-brand-text">Moma<span class="moma-brand-sub">bis</span></span>
+        <span class="moma-internal-badge">ENTERPRISE</span>
+      </button>
+
+      <!-- Universal Moma Omnibox (Search + OneBox + Direct go/links + Predictive Typeahead) -->
+      <div class="moma-omnibox-wrapper">
+        <form id="globalSearchForm" class="moma-omnibox" role="search">
+          <span class="omnibox-prefix" id="omniboxModeBadge">Moma Search</span>
+          <input
+            type="search"
+            id="globalSearchInput"
+            class="omnibox-input"
+            placeholder="Rechercher, taper go/vpn, whatis:GRAD, owner:sophiel, source:servicenow..."
+            autocomplete="off"
+            aria-label="Recherche fédérée Moma, OneBox, opérateurs ou raccourci go/"
+          />
+          <kbd class="omnibox-shortcut" title="Appuyez sur / pour rechercher">/</kbd>
+          <button type="submit" class="btn-primary omnibox-submit">Rechercher</button>
+        </form>
+        <div id="omniboxTypeahead" class="omnibox-typeahead hidden" role="listbox" aria-label="Suggestions instantanées Moma"></div>
+      </div>
+    </div>
+
+    <div class="moma-header-right">
+      <!-- ACL Persona Switcher to demonstrate Zero-Trust ACL Trimming live -->
+      <div class="persona-switcher" title="Simuler un autre collaborateur pour tester le filtrage ACL en temps réel">
+        <label for="personaSelect" class="persona-label">Profil ACL actif :</label>
+        <select id="personaSelect" class="persona-select" aria-label="Changer de collaborateur actif"></select>
+      </div>
+
+      <div id="currentUserBadge" class="user-pill"></div>
+      <button type="button" id="logoutBtn" class="btn-ghost" title="Révoquer la session serveur">Déconnexion</button>
+    </div>
+  </header>
+
+  <!-- Primary Navigation Tabs -->
+  <nav class="moma-subnav" aria-label="Navigation principale Moma-bis">
+    <div class="subnav-tabs">
+      <button type="button" class="nav-tab active" data-view="home" id="tabHome">
+        My Moma &amp; Recherche
+      </button>
+      <button type="button" class="nav-tab" data-view="connectors" id="tabConnectors">
+        Connecteurs &amp; Outils Client (OneBox)
+      </button>
+      <button type="button" class="nav-tab" data-view="teams" id="tabTeams">
+        Teams &amp; Organigramme (Who’s Who)
+      </button>
+      <button type="button" class="nav-tab" data-view="golinks" id="tabGolinks">
+        Raccourcis go/links
+      </button>
+      <button type="button" class="nav-tab" data-view="whatis" id="tabWhatis">
+        Glossaire Whatis (go/whatis)
+      </button>
+      <button type="button" class="nav-tab" data-view="blueprint" id="tabBlueprint">
+        Architecture Moma (Blueprint)
+      </button>
+    </div>
+    <div class="subnav-status">
+      <span class="status-indicator"></span>
+      <span id="securityPostureLabel">Omnibox Prédictive • OneBox • Ask Moma Multi-Tour • ACL Zero-Trust</span>
+    </div>
+  </nav>
+
+  <!-- Main Content Container -->
+  <main class="moma-main">
+    <!-- Quick Suggestion Strip -->
+    <section class="quick-queries-bar" aria-label="Exemples de recherches Moma">
+      <span class="quick-label">Tester Recherche, Opérateurs &amp; OneBox :</span>
+      <div id="quickQueryChips" class="quick-chips"></div>
+    </section>
+
+    <!-- VIEW 1: HOME & FEDERATED SEARCH -->
+    <section id="viewHome" class="moma-view">
+      <!-- Search Results Section (Shown when a query is active) -->
+      <div id="searchResultsSection" class="search-results-wrapper hidden">
+        <div class="search-facets-bar">
+          <div id="searchFacetButtons" class="facet-buttons"></div>
+          <div class="search-actions-right">
+            <button type="button" id="searchCreateTicketBtn" class="btn-secondary btn-sm">+ Créer un ticket IT</button>
+            <button type="button" id="clearSearchBtn" class="btn-secondary btn-sm">Fermer la recherche</button>
+          </div>
+        </div>
+
+        <!-- Active Search Operators Banner -->
+        <div id="activeOperatorsBanner" class="hidden"></div>
+
+        <!-- Instant go/link Resolution Banner -->
+        <div id="exactGoMatchContainer" class="hidden"></div>
+
+        <!-- Moma OneBox Live Structured Cards (Whatis, ServiceNow, Workday, SAP, Custom Tools) -->
+        <div id="oneBoxContainer" class="onebox-grid hidden"></div>
+
+        <!-- Moma AI Overview + Multi-Turn Conversational "Ask Moma" -->
+        <div id="aiOverviewContainer" class="ai-overview-card"></div>
+
+        <!-- Federated Results Grid -->
+        <div id="federatedResultsContainer" class="federated-results-grid"></div>
+      </div>
+
+      <!-- Personalized "My Moma" Intranet Dashboard (Shown on Home default) -->
+      <div id="dashboardWidgetsSection" class="dashboard-grid">
+        <div class="dashboard-col-main">
+          <!-- Actionable Approvals Center (1-click Approve/Reject) -->
+          <div class="card">
+            <div class="card-header">
+              <div>
+                <h2 class="card-title">Centre d’Approbations &amp; Actions Directes (1-Click Moma Actions)</h2>
+                <p class="card-subtitle">
+                  Validez vos demandes SAP S/4HANA, Workday, GitLab ou IAM directement depuis Moma sans ouvrir chaque outil tiers.
+                </p>
+              </div>
+              <button type="button" id="openCreateTicketBtn" class="btn-primary btn-sm">+ Créer un ticket IT</button>
+            </div>
+            <div id="dashboardApprovalsList" class="docs-list"></div>
+          </div>
+
+          <!-- Connected Client Tools Strip -->
+          <div class="card">
+            <div class="card-header">
+              <div>
+                <h2 class="card-title">Sources &amp; Outils Tiers Connectés à l’Index Moma-bis</h2>
+                <p class="card-subtitle">
+                  Contrairement aux outils internes propres à Google (Buganizer, g3doc), chaque client branche ici son propre écosystème (SharePoint, ServiceNow, Jira, SAP, Workday ou API métier).
+                </p>
+              </div>
+              <button type="button" id="openConnectorsViewBtn" class="btn-link">Intégrer un outil →</button>
+            </div>
+            <div id="dashboardConnectorsStrip" class="connectors-mini-grid"></div>
+          </div>
+
+          <div class="card">
+            <div class="card-header">
+              <h2 class="card-title">Raccourcis Internes Populaires (go/links)</h2>
+              <button type="button" id="openGoLinksViewBtn" class="btn-link">Gérer tous les go/links →</button>
+            </div>
+            <div id="dashboardGoLinksGrid" class="golinks-mini-grid"></div>
+          </div>
+
+          <div class="card">
+            <div class="card-header">
+              <h2 class="card-title">Base de Connaissances Fédérée (ACL Filtrées par Connecteur)</h2>
+              <span id="dashboardAclBadge" class="badge badge-teal"></span>
+            </div>
+            <div id="dashboardDocsList" class="docs-list"></div>
+          </div>
+        </div>
+
+        <aside class="dashboard-col-side">
+          <!-- Personalized Daily Agenda ("Up Next") -->
+          <div class="card">
+            <div class="card-header">
+              <h2 class="card-title">Mon Agenda du Jour (« Up Next »)</h2>
+              <span class="badge badge-blue">Google Calendar / Outlook</span>
+            </div>
+            <div id="dashboardMeetingsList" class="tickets-list"></div>
+          </div>
+
+          <!-- Campus Life & Cafeteria Menu Widget -->
+          <div class="card">
+            <div class="card-header">
+              <h2 class="card-title">Vie de Campus &amp; Menu Cafétéria (go/menu)</h2>
+              <span id="dashboardCampusBadge" class="badge badge-green"></span>
+            </div>
+            <div id="dashboardCampusCard" class="campus-widget-body"></div>
+          </div>
+
+          <div class="card">
+            <div class="card-header">
+              <h2 class="card-title">Actualités &amp; Annonces Internes</h2>
+            </div>
+            <div id="dashboardAnnouncements" class="announcements-list"></div>
+          </div>
+
+          <div class="card">
+            <div class="card-header">
+              <h2 class="card-title">Flux Temps Réel (ServiceNow, Jira, SAP)</h2>
+            </div>
+            <div id="dashboardTickets" class="tickets-list"></div>
+          </div>
+        </aside>
+      </div>
+    </section>
+
+    <!-- VIEW 2: CONNECTORS & CUSTOM CLIENT TOOLS STUDIO (MOMA ONEBOX) -->
+    <section id="viewConnectors" class="moma-view hidden">
+      <div class="golinks-layout">
+        <div class="golinks-main card">
+          <div class="card-header">
+            <div>
+              <h2 class="card-title">Hub de Connecteurs &amp; Modules Temps Réel « Moma OneBox »</h2>
+              <p class="card-subtitle">
+                Activez ou désactivez n’importe quel connecteur pour observer l’impact immédiat sur la recherche fédérée et l’AI Overview, ou branchez vos propres outils à droite.
+              </p>
+            </div>
+          </div>
+          <div id="connectorsListContainer" class="docs-list"></div>
+        </div>
+
+        <aside class="golinks-create card">
+          <div class="card-header">
+            <div>
+              <h2 class="card-title">Intégrer votre propre Outil Interne</h2>
+              <p class="card-subtitle">
+                Ajoutez un outil tiers ou métier (ex: Salesforce, Zendesk, Datadog, ERP maison). Il sera immédiatement indexé avec une carte <strong>OneBox</strong> et un lien <code>go/</code>.
+              </p>
+            </div>
+          </div>
+
+          <div class="preset-bar">
+            <span class="info-label">Pré-remplir un modèle d’outil client :</span>
+            <div id="connectorPresetsRow" class="quick-chips"></div>
+          </div>
+
+          <form id="createConnectorForm" class="golink-form">
+            <label class="form-label" for="connNameInput">Nom de l’outil client</label>
+            <input
+              type="text"
+              id="connNameInput"
+              class="form-input"
+              placeholder="ex: Salesforce CRM Enterprise"
+              required
+            />
+
+            <label class="form-label" for="connKeyInput">Identifiant court &amp; Raccourci go/ associé</label>
+            <div class="input-with-prefix">
+              <span class="prefix-tag">go/</span>
+              <input
+                type="text"
+                id="connKeyInput"
+                class="form-input"
+                placeholder="salesforce"
+                pattern="[a-zA-Z0-9-_]{2,32}"
+                required
+              />
+            </div>
+
+            <label class="form-label" for="connVendorInput">Éditeur / Équipe Propriétaire</label>
+            <input
+              type="text"
+              id="connVendorInput"
+              class="form-input"
+              placeholder="ex: Salesforce / Direction Commerciale"
+              required
+            />
+
+            <label class="form-label" for="connProtocolInput">Protocole d’Intégration &amp; Sync ACL</label>
+            <select id="connProtocolInput" class="form-select">
+              <option value="REST API + Webhook + OAuth 2.0">REST API + Webhook + OAuth 2.0</option>
+              <option value="GraphQL + OIDC Principal Propagation">GraphQL + OIDC Principal Propagation</option>
+              <option value="SDK Connecteur Push/Pull (Cloud Search Schema)">SDK Connecteur Push/Pull (Cloud Search Schema)</option>
+              <option value="MCP Server Tool + mTLS">MCP Server Tool + mTLS</option>
+            </select>
+
+            <label class="form-label" for="connUrlInput">URL de base de l’outil</label>
+            <input
+              type="url"
+              id="connUrlInput"
+              class="form-input"
+              placeholder="https://salesforce.corp.internal"
+              required
+            />
+
+            <label class="form-label" for="connTriggerInput">Mots-clés déclencheurs Moma OneBox (séparés par virgule)</label>
+            <input
+              type="text"
+              id="connTriggerInput"
+              class="form-input"
+              placeholder="ex: sf-, salesforce, client, contrat, opportunité"
+              required
+            />
+
+            <label class="form-label" for="connDeptInput">Restriction d’Accès (ACL Trimming)</label>
+            <select id="connDeptInput" class="form-select">
+              <option value="ALL">Tous les collaborateurs (ALL)</option>
+              <option value="Engineering">Engineering uniquement</option>
+              <option value="Security">Security &amp; Executive uniquement</option>
+              <option value="People Ops">People Ops (RH) &amp; Executive uniquement</option>
+              <option value="IT Operations">IT Operations uniquement</option>
+            </select>
+
+            <label class="form-label" for="connMetricLabelInput">Indicateur Live OneBox (Libellé)</label>
+            <input
+              type="text"
+              id="connMetricLabelInput"
+              class="form-input"
+              placeholder="ex: Pipeline Commercial Q4 / Statut"
+              required
+            />
+
+            <label class="form-label" for="connMetricValueInput">Indicateur Live OneBox (Valeur temps réel)</label>
+            <input
+              type="text"
+              id="connMetricValueInput"
+              class="form-input"
+              placeholder="ex: 42 comptes actifs • SLA Support 99.8%"
+              required
+            />
+
+            <label class="form-label" for="connSampleTitleInput">Titre du 1er document/enregistrement synchronisé</label>
+            <input
+              type="text"
+              id="connSampleTitleInput"
+              class="form-input"
+              placeholder="ex: Guide d’utilisation &amp; Gouvernance Salesforce CRM"
+              required
+            />
+
+            <label class="form-label" for="connSampleContentInput">Contenu indexé pour la recherche &amp; Gemini AI Overview</label>
+            <textarea
+              id="connSampleContentInput"
+              class="form-textarea"
+              rows="3"
+              placeholder="Décrivez les règles, procédures ou données de cet outil afin que Moma AI Overview puisse répondre aux questions des collaborateurs..."
+              required
+            ></textarea>
+
+            <button type="submit" class="btn-primary btn-full">Brancher l’outil dans Moma-bis</button>
+          </form>
+        </aside>
+      </div>
+    </section>
+
+    <!-- VIEW 3: TEAMS & ORG CHART (WHO'S WHO) -->
+    <section id="viewTeams" class="moma-view hidden">
+      <div class="teams-layout">
+        <!-- Left Directory Sidebar -->
+        <aside class="teams-sidebar card">
+          <div class="card-header">
+            <h2 class="card-title">Annuaire Collaborateurs</h2>
+          </div>
+          <div class="teams-filters">
+            <input
+              type="search"
+              id="peopleSearchInput"
+              class="form-input"
+              placeholder="Filtrer par nom, @ldap, compétence, badge..."
+              aria-label="Filtrer l'annuaire"
+            />
+            <select id="peopleDeptSelect" class="form-select" aria-label="Filtrer par département">
+              <option value="">Tous les départements</option>
+              <option value="Executive">Executive</option>
+              <option value="Engineering">Engineering</option>
+              <option value="Security">Security</option>
+              <option value="IT Operations">IT Operations</option>
+              <option value="People Ops">People Ops</option>
+            </select>
+          </div>
+          <div id="peopleDirectoryList" class="people-directory-list"></div>
+        </aside>
+
+        <!-- Right Employee Profile & Interactive Org Chart -->
+        <div class="teams-detail-pane">
+          <div id="personDetailContainer" class="card"></div>
+          <div id="orgChartContainer" class="card"></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- VIEW 4: GO/LINKS REGISTRY & RESOLVER -->
+    <section id="viewGolinks" class="moma-view hidden">
+      <div class="golinks-layout">
+        <div class="golinks-main card">
+          <div class="card-header">
+            <div>
+              <h2 class="card-title">Registre Central des Raccourcis Internes (go/links)</h2>
+              <p class="card-subtitle">
+                Chez Google, chaque outil, document ou équipe possède un alias mnémonique <code>go/alias</code> résolu par le DNS/proxy interne.
+              </p>
+            </div>
+            <select id="goCategoryFilter" class="form-select form-select-inline" aria-label="Filtrer par catégorie">
+              <option value="">Toutes les catégories</option>
+              <option value="Engineering &amp; SRE">Engineering &amp; SRE</option>
+              <option value="IT &amp; Security">IT &amp; Security</option>
+              <option value="People &amp; RH">People &amp; RH</option>
+              <option value="Company &amp; Strategy">Company &amp; Strategy</option>
+              <option value="Workplace &amp; Life">Workplace &amp; Life</option>
+            </select>
+          </div>
+
+          <!-- Interactive go/ Resolver Bar -->
+          <form id="goQuickTestForm" class="go-tester-bar">
+            <span class="go-tester-prefix">http://go/</span>
+            <input
+              type="text"
+              id="goQuickTestInput"
+              class="form-input"
+              placeholder="ex: vpn, oncall, perks, new-laptop, sap, okrs..."
+              required
+            />
+            <button type="submit" class="btn-primary">Tester la redirection go/</button>
+          </form>
+
+          <div id="goLinksTableContainer" class="golinks-table-wrapper"></div>
+        </div>
+
+        <aside class="golinks-create card">
+          <div class="card-header">
+            <h2 class="card-title">Créer ou Mettre à Jour un Lien go/</h2>
+          </div>
+          <form id="createGoLinkForm" class="golink-form">
+            <label class="form-label" for="goSlugInput">Alias court (go/...)</label>
+            <div class="input-with-prefix">
+              <span class="prefix-tag">go/</span>
+              <input
+                type="text"
+                id="goSlugInput"
+                class="form-input"
+                placeholder="mon-projet"
+                pattern="[a-zA-Z0-9-_]{2,40}"
+                required
+              />
+            </div>
+
+            <label class="form-label" for="goTargetInput">URL de destination (https://...)</label>
+            <input
+              type="url"
+              id="goTargetInput"
+              class="form-input"
+              placeholder="https://docs.corp.internal/mon-projet"
+              required
+            />
+
+            <label class="form-label" for="goTitleInput">Titre explicite</label>
+            <input
+              type="text"
+              id="goTitleInput"
+              class="form-input"
+              placeholder="Documentation Architecture Mon Projet"
+              required
+            />
+
+            <label class="form-label" for="goCategoryInput">Catégorie</label>
+            <select id="goCategoryInput" class="form-select">
+              <option value="Engineering &amp; SRE">Engineering &amp; SRE</option>
+              <option value="IT &amp; Security">IT &amp; Security</option>
+              <option value="People &amp; RH">People &amp; RH</option>
+              <option value="Company &amp; Strategy">Company &amp; Strategy</option>
+              <option value="Workplace &amp; Life">Workplace &amp; Life</option>
+            </select>
+
+            <label class="form-label" for="goDescInput">Description &amp; Mots-clés</label>
+            <textarea
+              id="goDescInput"
+              class="form-textarea"
+              rows="3"
+              placeholder="Décrivez à quoi sert ce raccourci pour faciliter sa recherche dans Moma..."
+              required
+            ></textarea>
+
+            <button type="submit" class="btn-primary btn-full">Enregistrer le raccourci go/</button>
+          </form>
+        </aside>
+      </div>
+    </section>
+
+    <!-- VIEW 5: WHATIS ACRONYM DECODER & INTERNAL GLOSSARY (go/whatis) -->
+    <section id="viewWhatis" class="moma-view hidden">
+      <div class="golinks-layout">
+        <div class="golinks-main card">
+          <div class="card-header">
+            <div>
+              <h2 class="card-title">Décodeur d’Acronymes &amp; Jargon Interne « Whatis » (go/whatis)</h2>
+              <p class="card-subtitle">
+                Chez Google, chaque acronyme (GRAD, TGIF, LGTM, OKR, SRE) possède une définition collaborative affichée en OneBox dès qu’on le cherche dans Moma ou via <code>whatis:TERME</code>.
+              </p>
+            </div>
+            <input
+              type="search"
+              id="whatisSearchInput"
+              class="form-input form-select-inline"
+              placeholder="Filtrer un acronyme (ex: GRAD, CAB, LGTM)..."
+              aria-label="Filtrer les acronymes"
+            />
+          </div>
+          <div id="whatisListContainer" class="docs-list"></div>
+        </div>
+
+        <aside class="golinks-create card">
+          <div class="card-header">
+            <div>
+              <h2 class="card-title">Ajouter un Acronyme au Glossaire Client</h2>
+              <p class="card-subtitle">
+                Enrichissez le dictionnaire interne de votre entreprise. L’acronyme déclenchera automatiquement une carte <strong>OneBox Whatis</strong> dans la recherche Moma.
+              </p>
+            </div>
+          </div>
+          <form id="createWhatisForm" class="golink-form">
+            <label class="form-label" for="whatisAcronymInput">Acronyme ou Terme Court</label>
+            <input
+              type="text"
+              id="whatisAcronymInput"
+              class="form-input"
+              placeholder="ex: PRA, SOC, CMDB, RUNBOOK"
+              pattern="[a-zA-Z0-9/_-]{2,24}"
+              required
+            />
+
+            <label class="form-label" for="whatisExpansionInput">Signification Complète (Expansion)</label>
+            <input
+              type="text"
+              id="whatisExpansionInput"
+              class="form-input"
+              placeholder="ex: Plan de Reprise d’Activité Critique"
+              required
+            />
+
+            <label class="form-label" for="whatisCategoryInput">Catégorie Métier</label>
+            <select id="whatisCategoryInput" class="form-select">
+              <option value="Engineering &amp; SRE">Engineering &amp; SRE</option>
+              <option value="ITSM &amp; Change">ITSM &amp; Change</option>
+              <option value="People &amp; RH">People &amp; RH</option>
+              <option value="Culture &amp; Gouvernance">Culture &amp; Gouvernance</option>
+              <option value="Strategy &amp; Finance">Strategy &amp; Finance</option>
+            </select>
+
+            <label class="form-label" for="whatisGoLinkInput">Raccourci go/ associé (optionnel)</label>
+            <input
+              type="text"
+              id="whatisGoLinkInput"
+              class="form-input"
+              placeholder="ex: go/pra ou go/oncall"
+            />
+
+            <label class="form-label" for="whatisDefInput">Définition &amp; Contexte Interne</label>
+            <textarea
+              id="whatisDefInput"
+              class="form-textarea"
+              rows="3"
+              placeholder="Expliquez comment cet acronyme est utilisé dans l’entreprise et quelles équipes sont concernées..."
+              required
+            ></textarea>
+
+            <button type="submit" class="btn-primary btn-full">Publier dans go/whatis</button>
+          </form>
+        </aside>
+      </div>
+    </section>
+
+    <!-- VIEW 6: CLIENT ARCHITECTURE BLUEPRINT -->
+    <section id="viewBlueprint" class="moma-view hidden">
+      <div id="blueprintContainer" class="blueprint-wrapper"></div>
+    </section>
+  </main>
+
+  <!-- Non-blocking Modal Dialog (Replaces native alert/confirm) -->
+  <div id="momaModalBackdrop" class="modal-backdrop hidden" role="dialog" aria-modal="true">
+    <div class="modal-card">
+      <div class="modal-header">
+        <h3 id="modalTitle" class="modal-title">Détail</h3>
+        <button type="button" id="modalCloseBtn" class="btn-ghost btn-sm">Fermer</button>
+      </div>
+      <div id="modalBody" class="modal-body"></div>
+    </div>
+  </div>
+
+  <!-- Non-blocking Toast Notification -->
+  <div id="momaToast" class="moma-toast hidden" role="status" aria-live="polite"></div>
+
+  <script src="/app.js" nonce="__CSP_NONCE__" defer></script>
+</body>
+</html>

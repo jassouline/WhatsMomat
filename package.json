@@ -1,0 +1,14 @@
+{
+  "name": "momabis-enterprise-portal",
+  "version": "1.0.0",
+  "description": "Moma-bis: Google Moma-inspired Enterprise Intranet, Federated Search, AI Overview (Gemini 3.8 Flash), Org Chart (Teams) & go/links Portal",
+  "type": "module",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "test": "node test/verify.js"
+  },
+  "engines": {
+    "node": ">=22.5.0"
+  }
+}

@@ -1,0 +1,8 @@
+node_modules/
+.env
+.env.*
+.session_secret
+*.sqlite
+*.sqlite-journal
+*.db
+.DS_Store
