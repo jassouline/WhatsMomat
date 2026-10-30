@@ -3,7 +3,8 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Moma-bis — Portail Intranet, Recherche Fédérée, OneBox, Teams &amp; go/links</title>
+  <title>WhatsMomat (Moma-bis) — Portail Intranet, Recherche Hybride RRF, OneBox, Teams &amp; go/links</title>
+  <link rel="search" type="application/opensearchdescription+xml" title="WhatsMomat" href="/opensearch.xml" />
   <link rel="stylesheet" href="/styles.css" />
 </head>
 <body>
@@ -76,7 +77,7 @@
     </div>
     <div class="subnav-status">
       <span class="status-indicator"></span>
-      <span id="securityPostureLabel">Omnibox Prédictive • OneBox • Ask Moma Multi-Tour • ACL Zero-Trust</span>
+      <span id="securityPostureLabel">Hybrid Vector+BM25 RRF • OpenSearch &amp; go/ • SCIM 2.0 • OneBox Live • ACL Zero-Trust</span>
     </div>
   </nav>
 
@@ -149,9 +150,10 @@
 
           <div class="card">
             <div class="card-header">
-              <h2 class="card-title">Raccourcis Internes Populaires (go/links)</h2>
+              <h2 class="card-title">Mes Favoris Épinglés &amp; Raccourcis Populaires (go/links)</h2>
               <button type="button" id="openGoLinksViewBtn" class="btn-link">Gérer tous les go/links →</button>
             </div>
+            <div id="dashboardPinnedGoLinks" class="pinned-golinks-strip hidden"></div>
             <div id="dashboardGoLinksGrid" class="golinks-mini-grid"></div>
           </div>
 
@@ -172,6 +174,17 @@
               <span class="badge badge-blue">Google Calendar / Outlook</span>
             </div>
             <div id="dashboardMeetingsList" class="tickets-list"></div>
+          </div>
+
+          <!-- Peer Kudos & Recognition Widget (go/kudos) -->
+          <div class="card">
+            <div class="card-header">
+              <div>
+                <h2 class="card-title">Peer Kudos &amp; Reconnaissance (go/kudos)</h2>
+              </div>
+              <button type="button" id="openSendKudosBtn" class="btn-secondary btn-sm">★ Envoyer</button>
+            </div>
+            <div id="dashboardKudosList" class="kudos-list"></div>
           </div>
 
           <!-- Campus Life & Cafeteria Menu Widget -->
@@ -313,6 +326,22 @@
               class="form-input"
               placeholder="ex: 42 comptes actifs • SLA Support 99.8%"
               required
+            />
+
+            <label class="form-label" for="connLiveUrlInput">Endpoint Live OneBox sortant (optionnel, anti-SSRF)</label>
+            <input
+              type="url"
+              id="connLiveUrlInput"
+              class="form-input"
+              placeholder="ex: https://api.outil-client.example/moma/onebox"
+            />
+
+            <label class="form-label" for="connApprovalWebhookInput">Webhook d’Approbation signé HMAC (optionnel)</label>
+            <input
+              type="url"
+              id="connApprovalWebhookInput"
+              class="form-input"
+              placeholder="ex: https://api.outil-client.example/moma/approvals"
             />
 
             <label class="form-label" for="connSampleTitleInput">Titre du 1er document/enregistrement synchronisé</label>

@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
+import http from 'node:http';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { server } from '../server.js';
@@ -12,7 +13,7 @@ async function runVerificationSuite() {
   await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
   const address = server.address();
   const baseUrl = `http://127.0.0.1:${address.port}`;
-  console.log(`[VERIFY] WhatsMomat v1.1 test server bound to ${baseUrl}`);
+  console.log(`[VERIFY] WhatsMomat v1.2 test server bound to ${baseUrl}`);
 
   try {
     // 0. Healthcheck Probe
@@ -20,7 +21,7 @@ async function runVerificationSuite() {
     assert.equal(healthRes.status, 200);
     const healthData = await healthRes.json();
     assert.equal(healthData.status, 'ok');
-    assert.equal(healthData.version, '1.1.0');
+    assert.equal(healthData.version, '1.2.0');
 
     // 1. Verify Security Headers, CORS Allow-List & Session Cookie Creation
     const homeRes = await fetch(`${baseUrl}/`, {
@@ -582,7 +583,356 @@ async function runVerificationSuite() {
       }
     }
 
-    console.log('[VERIFY] ALL 17 SUITES PASSED (CORE MOMA, ONEBOX, FTS5, WAL PERSISTENCE, INGEST API, IAP ZERO-TRUST, BOLA, AUDIT & CSP)!');
+    // 18. Verify OpenSearch Browser Discovery (/opensearch.xml, /api/opensearch-suggest) & MV3 Extension
+    const openSearchRes = await fetch(`${baseUrl}/opensearch.xml`);
+    assert.equal(openSearchRes.status, 200);
+    assert.ok(
+      (openSearchRes.headers.get('content-type') || '').includes('application/opensearchdescription+xml'),
+      'OpenSearch descriptor must serve application/opensearchdescription+xml'
+    );
+    const openSearchXml = await openSearchRes.text();
+    assert.ok(openSearchXml.includes('<ShortName>WhatsMomat</ShortName>'));
+    assert.ok(openSearchXml.includes('/?q={searchTerms}'));
+    assert.ok(openSearchXml.includes('/api/opensearch-suggest?q={searchTerms}'));
+
+    const osSuggestRes = await fetch(`${baseUrl}/api/opensearch-suggest?q=vpn`, {
+      headers: { Cookie: sessionCookie },
+    });
+    assert.equal(osSuggestRes.status, 200);
+    const osSuggestJson = await osSuggestRes.json();
+    assert.ok(Array.isArray(osSuggestJson) && osSuggestJson.length === 4, 'OpenSearch suggest must return 4-tuple array');
+    assert.equal(osSuggestJson[0], 'vpn');
+    assert.ok(osSuggestJson[1].some((item) => item.includes('go/vpn')), 'OpenSearch suggest must include go/vpn');
+
+    const extManifest = JSON.parse(
+      fs.readFileSync(path.resolve(__dirname, '../browser-extension/manifest.json'), 'utf-8')
+    );
+    assert.equal(extManifest.manifest_version, 3, 'Browser extension must use Manifest V3');
+    assert.equal(extManifest.omnibox.keyword, 'moma', 'Browser extension must register moma omnibox keyword');
+
+    // 19. Verify Hybrid Semantic Vector + BM25 RRF Search (Retrieves semantic match with zero exact title words)
+    const semanticRes = await fetch(
+      `${baseUrl}/api/search?q=${encodeURIComponent('fauteuil lombaire mal au dos')}`,
+      { headers: { Cookie: sessionCookie } }
+    );
+    assert.equal(semanticRes.status, 200);
+    const semanticData = await semanticRes.json();
+    const matchedErgoDoc = semanticData.documents.find((d) => d.docCode === 'DOC-HR-001');
+    assert.ok(
+      matchedErgoDoc,
+      'Hybrid Vector+BM25 RRF must retrieve DOC-HR-001 (Télétravail & Budget Équipement) via semantic concept similarity'
+    );
+    assert.ok(
+      matchedErgoDoc.matchMode === 'semantic-vector' || matchedErgoDoc.matchMode === 'hybrid-rrf',
+      'Matched semantic document must report semantic-vector or hybrid-rrf matchMode'
+    );
+    assert.ok(
+      !semanticData.documents.some((d) => d.docCode === 'DOC-SEC-001'),
+      'Hybrid Vector+BM25 RRF must still strictly enforce ACL Trimming against unauthorized SecOps docs'
+    );
+
+    // 20. Verify SCIM 2.0 User Provisioning & Immediate Active Session Revocation on Offboarding
+    const scimToken = crypto.randomBytes(24).toString('hex');
+    process.env.SCIM_API_TOKEN = scimToken;
+    try {
+      const scimUnauthRes = await fetch(`${baseUrl}/api/v1/scim/v2/Users`);
+      assert.equal(scimUnauthRes.status, 401, 'SCIM endpoint without Bearer token must return 401');
+
+      const scimCreateRes = await fetch(`${baseUrl}/api/v1/scim/v2/Users`, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${scimToken}`,
+          'Content-Type': 'application/scim+json',
+        },
+        body: JSON.stringify({
+          schemas: ['urn:ietf:params:scim:schemas:core:2.0:User'],
+          externalId: 'amartin',
+          userName: 'alice.martin@corp.internal',
+          active: true,
+          name: { formatted: 'Alice Martin' },
+          title: 'Principal Cloud Architect',
+          'urn:ietf:params:scim:schemas:extension:enterprise:2.0:User': {
+            department: 'Engineering',
+            organization: 'Cloud Infrastructure',
+          },
+        }),
+      });
+      assert.equal(scimCreateRes.status, 201, 'SCIM user creation must return 201 Created');
+      const scimCreated = await scimCreateRes.json();
+      assert.equal(scimCreated.id, 'amartin');
+      assert.equal(scimCreated.active, true);
+
+      // Open a dedicated session cookie for @amartin
+      const aliceInitRes = await fetch(`${baseUrl}/api/session`);
+      const aliceCookie = (aliceInitRes.headers.get('set-cookie') || '').split(';')[0];
+      const aliceSess = await aliceInitRes.json();
+
+      const aliceSwitchRes = await fetch(`${baseUrl}/api/auth/switch-persona`, {
+        method: 'POST',
+        headers: {
+          Cookie: aliceCookie,
+          'Content-Type': 'application/json',
+          'X-CSRF-Token': aliceSess.csrfToken,
+        },
+        body: JSON.stringify({ ldap: 'amartin' }),
+      });
+      assert.equal(aliceSwitchRes.status, 200, 'Switching demo session to SCIM-provisioned @amartin must succeed');
+
+      const aliceDashBefore = await fetch(`${baseUrl}/api/dashboard`, {
+        headers: { Cookie: aliceCookie },
+      });
+      assert.equal(aliceDashBefore.status, 200, 'Active SCIM user session must access /api/dashboard');
+
+      // Offboard / deactivate @amartin via SCIM 2.0 (active: false)
+      const scimDeactivateRes = await fetch(`${baseUrl}/api/v1/scim/v2/Users`, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${scimToken}`,
+          'Content-Type': 'application/scim+json',
+        },
+        body: JSON.stringify({
+          schemas: ['urn:ietf:params:scim:schemas:core:2.0:User'],
+          externalId: 'amartin',
+          userName: 'alice.martin@corp.internal',
+          active: false,
+          name: { formatted: 'Alice Martin' },
+        }),
+      });
+      assert.equal(scimDeactivateRes.status, 200, 'SCIM user deactivation must return 200');
+
+      const aliceDashAfter = await fetch(`${baseUrl}/api/dashboard`, {
+        headers: { Cookie: aliceCookie },
+      });
+      assert.equal(
+        aliceDashAfter.status,
+        401,
+        'Deactivating user via SCIM 2.0 must immediately revoke all active SQLite sessions (401)'
+      );
+    } finally {
+      delete process.env.SCIM_API_TOKEN;
+    }
+
+    // 21. Verify SSRF-Hardened Live Outbound OneBox Federation & HMAC-Signed Approval Webhooks
+    await fetch(`${baseUrl}/api/auth/switch-persona`, {
+      method: 'POST',
+      headers: {
+        Cookie: sessionCookie,
+        'Content-Type': 'application/json',
+        'X-CSRF-Token': sessData.csrfToken,
+      },
+      body: JSON.stringify({ ldap: 'jassouline' }),
+    });
+
+    for (const forbiddenUrl of [
+      'http://169.254.169.254/latest/meta-data/',
+      'http://10.0.0.8/internal-api',
+      'http://192.168.1.10/admin',
+      'file:///etc/passwd',
+    ]) {
+      const ssrfBlockedRes = await fetch(`${baseUrl}/api/connectors/endpoints`, {
+        method: 'POST',
+        headers: {
+          Cookie: sessionCookie,
+          'Content-Type': 'application/json',
+          'X-CSRF-Token': sessData.csrfToken,
+        },
+        body: JSON.stringify({
+          connectorKey: 'sap-erp',
+          liveEndpointUrl: forbiddenUrl,
+        }),
+      });
+      assert.equal(
+        ssrfBlockedRes.status,
+        400,
+        `SSRF protection must block private/metadata URL ${forbiddenUrl} with 400`
+      );
+    }
+
+    let capturedWebhook = null;
+    const mockPartnerServer = http.createServer((req, res) => {
+      const reqUrl = new URL(req.url || '/', 'http://127.0.0.1');
+      if (req.method === 'GET' && reqUrl.pathname === '/live-onebox') {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(
+          JSON.stringify({
+            badgeText: 'SAP Live Webhook OneBox',
+            cardTitle: 'SAP S/4HANA — Taux Change & Clôture Temps Réel',
+            cardSubtitle: 'Réponse HTTP sortante vérifiée',
+            fields: [{ label: 'Statut Clôture', value: 'Ouvert • EUR/USD 1.092' }],
+          })
+        );
+        return;
+      }
+      if (req.method === 'POST' && reqUrl.pathname === '/approval-hook') {
+        const chunks = [];
+        req.on('data', (c) => chunks.push(c));
+        req.on('end', () => {
+          capturedWebhook = {
+            signature: req.headers['x-whatsmomat-signature'],
+            event: req.headers['x-whatsmomat-event'],
+            body: JSON.parse(Buffer.concat(chunks).toString('utf-8')),
+          };
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ received: true }));
+        });
+        return;
+      }
+      res.writeHead(404).end();
+    });
+
+    await new Promise((resolve) => mockPartnerServer.listen(0, '127.0.0.1', resolve));
+    const mockPort = mockPartnerServer.address().port;
+    process.env.ALLOW_LOOPBACK_WEBHOOKS = '1';
+    try {
+      const cfgRes = await fetch(`${baseUrl}/api/connectors/endpoints`, {
+        method: 'POST',
+        headers: {
+          Cookie: sessionCookie,
+          'Content-Type': 'application/json',
+          'X-CSRF-Token': sessData.csrfToken,
+        },
+        body: JSON.stringify({
+          connectorKey: 'sap-erp',
+          liveEndpointUrl: `http://127.0.0.1:${mockPort}/live-onebox`,
+          approvalWebhookUrl: `http://127.0.0.1:${mockPort}/approval-hook`,
+        }),
+      });
+      assert.equal(cfgRes.status, 200, 'Configuring loopback test endpoints in non-prod test mode must return 200');
+
+      const liveSearchRes = await fetch(`${baseUrl}/api/search?q=sap`, {
+        headers: { Cookie: sessionCookie },
+      });
+      assert.equal(liveSearchRes.status, 200);
+      const liveSearchData = await liveSearchRes.json();
+      assert.ok(
+        liveSearchData.oneBoxCards.some((c) => c.cardTitle.includes('Taux Change & Clôture Temps Réel')),
+        'Search must federate live outbound OneBox card from partner endpoint'
+      );
+
+      const sapApproveRes = await fetch(`${baseUrl}/api/approvals/act`, {
+        method: 'POST',
+        headers: {
+          Cookie: sessionCookie,
+          'Content-Type': 'application/json',
+          'X-CSRF-Token': sessData.csrfToken,
+        },
+        body: JSON.stringify({
+          approvalKey: 'PO-2026-8904',
+          decision: 'APPROVED',
+        }),
+      });
+      assert.equal(sapApproveRes.status, 200);
+      const sapApproveData = await sapApproveRes.json();
+      assert.ok(sapApproveData.webhookDelivery?.delivered, 'Approval must dispatch outbound webhook');
+      assert.ok(capturedWebhook, 'Mock partner server must receive approval webhook POST');
+      assert.equal(capturedWebhook.event, 'moma.approval.decided');
+      assert.ok(
+        String(capturedWebhook.signature || '').startsWith('sha256='),
+        'Outbound approval webhook must carry HMAC-SHA256 X-WhatsMomat-Signature header'
+      );
+      assert.equal(capturedWebhook.body.approvalKey, 'PO-2026-8904');
+    } finally {
+      delete process.env.ALLOW_LOOPBACK_WEBHOOKS;
+      mockPartnerServer.close();
+    }
+
+    // 22. Verify Moma Culture: Peer Kudos (go/kudos), Pinned go/links & ACL Full Document Reader + Freshness
+    const selfKudoRes = await fetch(`${baseUrl}/api/kudos`, {
+      method: 'POST',
+      headers: {
+        Cookie: sessionCookie,
+        'Content-Type': 'application/json',
+        'X-CSRF-Token': sessData.csrfToken,
+      },
+      body: JSON.stringify({
+        toLdap: 'jassouline',
+        badgeType: 'Excellence Technique',
+        message: 'Tentative auto-kudo interdite',
+      }),
+    });
+    assert.equal(selfKudoRes.status, 400, 'Sending a Peer Kudo to oneself must fail with 400');
+
+    const validKudoRes = await fetch(`${baseUrl}/api/kudos`, {
+      method: 'POST',
+      headers: {
+        Cookie: sessionCookie,
+        'Content-Type': 'application/json',
+        'X-CSRF-Token': sessData.csrfToken,
+      },
+      body: JSON.stringify({
+        toLdap: 'sophiel',
+        badgeType: 'Sécurité & Fiabilité',
+        points: 100,
+        message: 'Bravo pour le durcissement Zero-Trust BeyondCorp et anti-SSRF !',
+      }),
+    });
+    assert.equal(validKudoRes.status, 201, 'Sending a Peer Kudo to a colleague must return 201');
+
+    const sophieProfileRes = await fetch(`${baseUrl}/api/people/sophiel`, {
+      headers: { Cookie: sessionCookie },
+    });
+    const sophieProfile = await sophieProfileRes.json();
+    assert.ok(
+      sophieProfile.kudosReceived.some((k) => k.message.includes('anti-SSRF')),
+      'Recipient Teams profile must list received Peer Kudos'
+    );
+
+    const pinRes = await fetch(`${baseUrl}/api/pins/toggle`, {
+      method: 'POST',
+      headers: {
+        Cookie: sessionCookie,
+        'Content-Type': 'application/json',
+        'X-CSRF-Token': sessData.csrfToken,
+      },
+      body: JSON.stringify({ slug: 'vpn' }),
+    });
+    assert.equal(pinRes.status, 200);
+    const pinData = await pinRes.json();
+    assert.equal(pinData.pinned, true, 'Toggling unpinned go/vpn must pin it');
+
+    // Switch to standard employee @thomasr and verify BOLA/ACL enforcement on GET /api/documents/:docCode
+    await fetch(`${baseUrl}/api/auth/switch-persona`, {
+      method: 'POST',
+      headers: {
+        Cookie: sessionCookie,
+        'Content-Type': 'application/json',
+        'X-CSRF-Token': sessData.csrfToken,
+      },
+      body: JSON.stringify({ ldap: 'thomasr' }),
+    });
+    const secDocDenied = await fetch(`${baseUrl}/api/documents/DOC-SEC-001`, {
+      headers: { Cookie: sessionCookie },
+    });
+    assert.equal(
+      secDocDenied.status,
+      403,
+      'Full document reader must return 403 when non-SecOps employee requests DOC-SEC-001'
+    );
+
+    const engDocOk = await fetch(`${baseUrl}/api/documents/DOC-ENG-001`, {
+      headers: { Cookie: sessionCookie },
+    });
+    assert.equal(engDocOk.status, 200, 'Engineering employee must read DOC-ENG-001');
+
+    const flagRes = await fetch(`${baseUrl}/api/documents/flag-outdated`, {
+      method: 'POST',
+      headers: {
+        Cookie: sessionCookie,
+        'Content-Type': 'application/json',
+        'X-CSRF-Token': sessData.csrfToken,
+      },
+      body: JSON.stringify({
+        docCode: 'DOC-ENG-001',
+        reason: 'Nouvelle rotation PagerDuty Q4 à documenter',
+      }),
+    });
+    assert.equal(flagRes.status, 200);
+    const flagData = await flagRes.json();
+    assert.equal(flagData.document.outdatedFlagged, true, 'Flagging document outdated must persist outdatedFlagged=true');
+
+    console.log(
+      '[VERIFY] ALL 22 SUITES PASSED (CORE MOMA, HYBRID VECTOR+BM25 RRF, OPENSEARCH+MV3, SCIM 2.0+REVOCATION, ANTI-SSRF LIVE ONEBOX+WEBHOOKS, KUDOS/PINS/FRESHNESS, IAP, BOLA, AUDIT & CSP)!'
+    );
   } finally {
     server.close();
   }

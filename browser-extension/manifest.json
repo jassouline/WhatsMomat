@@ -1,0 +1,30 @@
+{
+  "manifest_version": 3,
+  "name": "WhatsMomat — go/links & Omnibox Search",
+  "version": "1.2.0",
+  "description": "Intercepte les raccourcis http://go/<alias> dans la barre d'adresse et active le mot-clé omnibox 'moma' avec suggestions en direct.",
+  "permissions": [
+    "declarativeNetRequest"
+  ],
+  "host_permissions": [
+    "*://go/*",
+    "http://127.0.0.1:3000/*",
+    "http://localhost:3000/*"
+  ],
+  "declarative_net_request": {
+    "rule_resources": [
+      {
+        "id": "go_links_redirect",
+        "enabled": true,
+        "path": "rules.json"
+      }
+    ]
+  },
+  "omnibox": {
+    "keyword": "moma"
+  },
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  }
+}

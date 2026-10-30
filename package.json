@@ -1,7 +1,7 @@
 {
   "name": "whatsmomat",
-  "version": "1.1.0",
-  "description": "WhatsMomat: Google Moma-inspired Enterprise Intranet, Federated ACL Search (FTS5 + OneBox), AI Overview & Multi-Turn Ask Moma (@google/genai), Teams Org Chart, Whatis Glossary & go/links Portal",
+  "version": "1.2.0",
+  "description": "WhatsMomat: Google Moma-inspired Enterprise Intranet, Hybrid BM25+Vector RRF Search, OpenSearch & MV3 go/ Extension, SCIM 2.0, Live OneBox, AI Overview (@google/genai), Teams & Kudos Portal",
   "type": "module",
   "main": "server.js",
   "scripts": {

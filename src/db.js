@@ -3,6 +3,13 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import {
+  EMBEDDING_DIM,
+  computeLocalSemanticEmbedding,
+  cosineSimilarity,
+  computeRrfScore,
+} from './embeddings.js';
+import { validateOutboundUrlSyntax } from './outbound.js';
 
 // TODO(security): In production deployments with an external RDBMS (e.g., Cloud SQL / AlloyDB),
 // enforce mTLS connections, isolate database schemas per service, and use a least-privilege
@@ -311,11 +318,64 @@ export function initDatabase() {
       client_ip TEXT NOT NULL DEFAULT '127.0.0.1',
       created_at TEXT NOT NULL
     );
+
+    CREATE TABLE IF NOT EXISTS sessions (
+      session_id TEXT PRIMARY KEY,
+      user_ldap TEXT NOT NULL,
+      csrf_token TEXT NOT NULL,
+      created_at INTEGER NOT NULL,
+      expires_at INTEGER NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS document_embeddings (
+      doc_code TEXT PRIMARY KEY,
+      model TEXT NOT NULL,
+      dimensions INTEGER NOT NULL,
+      vector_json TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS kudos (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      from_ldap TEXT NOT NULL,
+      to_ldap TEXT NOT NULL,
+      badge_type TEXT NOT NULL,
+      message TEXT NOT NULL,
+      points INTEGER NOT NULL DEFAULT 50,
+      created_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS user_pins (
+      user_ldap TEXT NOT NULL,
+      slug TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      PRIMARY KEY (user_ldap, slug)
+    );
   `);
 
+  ensureV12Migrations();
   seedInitialData();
   ensureSupplementalGoLinks();
+  ensureDefaultKudosAndPins();
   rebuildDocumentsFts();
+  ensureDocumentEmbeddings();
+}
+
+function ensureColumnExists(tableName, columnName, definitionSql) {
+  const allowedTables = new Set(['connectors', 'documents', 'users']);
+  if (!allowedTables.has(tableName)) return;
+  const cols = db.prepare(`PRAGMA table_info(${tableName})`).all();
+  if (!cols.some((c) => c.name === columnName)) {
+    db.exec(`ALTER TABLE ${tableName} ADD COLUMN ${columnName} ${definitionSql}`);
+  }
+}
+
+function ensureV12Migrations() {
+  ensureColumnExists('connectors', 'live_endpoint_url', 'TEXT DEFAULT NULL');
+  ensureColumnExists('connectors', 'approval_webhook_url', 'TEXT DEFAULT NULL');
+  ensureColumnExists('documents', 'outdated_flagged', 'INTEGER NOT NULL DEFAULT 0');
+  ensureColumnExists('documents', 'outdated_reason', 'TEXT DEFAULT NULL');
+  ensureColumnExists('documents', 'outdated_by_ldap', 'TEXT DEFAULT NULL');
 }
 
 function ensureSupplementalGoLinks() {
@@ -341,6 +401,16 @@ function ensureSupplementalGoLinks() {
       hits: 5310,
       is_verified: 1,
     },
+    {
+      slug: 'kudos',
+      target_url: 'https://moma.corp.internal/teams/peer-kudos',
+      title: 'Peer Kudos & Reconnaissance Collaborateurs (go/kudos)',
+      description: 'Programme de reconnaissance pair-à-pair intégré aux profils Moma Teams et au fil My Moma.',
+      category: 'People & RH',
+      owner_ldap: 'nadiab',
+      hits: 3840,
+      is_verified: 1,
+    },
   ];
   const stmt = db.prepare(`
     INSERT OR IGNORE INTO go_links (
@@ -363,6 +433,149 @@ function ensureSupplementalGoLinks() {
   }
 }
 
+function ensureDefaultKudosAndPins() {
+  const kudoCount = db.prepare('SELECT COUNT(*) AS cnt FROM kudos').get();
+  if (!kudoCount || kudoCount.cnt === 0) {
+    const insertKudo = db.prepare(`
+      INSERT INTO kudos (from_ldap, to_ldap, badge_type, message, points, created_at)
+      VALUES (?, ?, ?, ?, ?, ?)
+    `);
+    insertKudo.run(
+      'clairem',
+      'jassouline',
+      'Excellence Technique',
+      'Conception de l’architecture fédérée WhatsMomat, du moteur OneBox et de la gouvernance ACL Zero-Trust.',
+      100,
+      '2026-10-29T16:20:00Z'
+    );
+    insertKudo.run(
+      'jassouline',
+      'thomasr',
+      'Sécurité & Fiabilité',
+      'Résolution de l’alerte SRE en moins de 4 minutes avec maintien du SLO Search à 99.97%.',
+      75,
+      '2026-10-29T18:05:00Z'
+    );
+    insertKudo.run(
+      'sophiel',
+      'karimz',
+      'Esprit d’Équipe',
+      'Synchronisation exemplaire des groupes ACL Entra ID & Confluence sur le connecteur documentaire.',
+      50,
+      '2026-10-30T08:40:00Z'
+    );
+  }
+
+  const pinCount = db.prepare('SELECT COUNT(*) AS cnt FROM user_pins').get();
+  if (!pinCount || pinCount.cnt === 0) {
+    const insertPin = db.prepare('INSERT OR IGNORE INTO user_pins (user_ldap, slug, created_at) VALUES (?, ?, ?)');
+    for (const slug of ['oncall', 'architecture', 'gemini-sandbox']) {
+      insertPin.run('jassouline', slug, '2026-10-29T09:00:00Z');
+    }
+    insertPin.run('sophiel', 'sec-incident', '2026-10-29T09:00:00Z');
+    insertPin.run('nadiab', 'holiday', '2026-10-29T09:00:00Z');
+  }
+}
+
+export function syncDocumentEmbedding(docRow, customVector = null, modelName = 'local-semantic-v1') {
+  if (!docRow || !docRow.doc_code) return;
+  const textPayload = `${docRow.title || ''} ${docRow.summary || ''} ${docRow.content || ''} ${docRow.tags_json || ''} ${docRow.category || ''}`;
+  const vec = Array.isArray(customVector) && customVector.length === EMBEDDING_DIM
+    ? customVector
+    : computeLocalSemanticEmbedding(textPayload);
+  db.prepare(`
+    INSERT INTO document_embeddings (doc_code, model, dimensions, vector_json, updated_at)
+    VALUES (?, ?, ?, ?, ?)
+    ON CONFLICT(doc_code) DO UPDATE SET
+      model = excluded.model,
+      dimensions = excluded.dimensions,
+      vector_json = excluded.vector_json,
+      updated_at = excluded.updated_at
+  `).run(
+    docRow.doc_code,
+    modelName,
+    vec.length,
+    JSON.stringify(vec),
+    new Date().toISOString()
+  );
+}
+
+export function ensureDocumentEmbeddings() {
+  const docs = db.prepare('SELECT * FROM documents').all();
+  const existingCodes = new Set(
+    db.prepare('SELECT doc_code FROM document_embeddings').all().map((r) => r.doc_code)
+  );
+  for (const d of docs) {
+    if (!existingCodes.has(d.doc_code)) {
+      syncDocumentEmbedding(d);
+    }
+  }
+}
+
+/**
+ * Persistent SQLite Session Management (survives process restarts & supports immediate SCIM revocation)
+ */
+export function createDbSession(userLdap, ttlMs = 30 * 60 * 1000) {
+  const rawId = crypto.randomBytes(32).toString('hex');
+  const csrfToken = crypto.randomBytes(24).toString('hex');
+  const now = Date.now();
+  const expiresAt = now + ttlMs;
+  db.prepare(`
+    INSERT INTO sessions (session_id, user_ldap, csrf_token, created_at, expires_at)
+    VALUES (?, ?, ?, ?, ?)
+  `).run(rawId, String(userLdap || 'jassouline').toLowerCase(), csrfToken, now, expiresAt);
+  return {
+    id: rawId,
+    userLdap: String(userLdap || 'jassouline').toLowerCase(),
+    csrfToken,
+    createdAt: now,
+    expiresAt,
+  };
+}
+
+export function getValidDbSession(sessionId, ttlMs = 30 * 60 * 1000) {
+  if (!sessionId) return null;
+  const now = Date.now();
+  const row = db.prepare('SELECT * FROM sessions WHERE session_id = ?').get(String(sessionId));
+  if (!row) return null;
+  if (row.expires_at <= now) {
+    db.prepare('DELETE FROM sessions WHERE session_id = ?').run(row.session_id);
+    return null;
+  }
+  // Verify user is still active (immediate revocation if user was deactivated via SCIM)
+  const activeUser = db.prepare('SELECT ldap FROM users WHERE ldap = ? AND active = 1').get(row.user_ldap);
+  if (!activeUser) {
+    db.prepare('DELETE FROM sessions WHERE session_id = ?').run(row.session_id);
+    return null;
+  }
+  const nextExpiry = now + ttlMs;
+  db.prepare('UPDATE sessions SET expires_at = ? WHERE session_id = ?').run(nextExpiry, row.session_id);
+  return {
+    id: row.session_id,
+    userLdap: row.user_ldap,
+    csrfToken: row.csrf_token,
+    createdAt: row.created_at,
+    expiresAt: nextExpiry,
+  };
+}
+
+export function updateDbSessionUser(sessionId, nextUserLdap) {
+  db.prepare('UPDATE sessions SET user_ldap = ? WHERE session_id = ?').run(
+    String(nextUserLdap || '').toLowerCase(),
+    String(sessionId || '')
+  );
+}
+
+export function deleteDbSession(sessionId) {
+  if (!sessionId) return;
+  db.prepare('DELETE FROM sessions WHERE session_id = ?').run(String(sessionId));
+}
+
+export function deleteAllUserDbSessions(userLdap) {
+  if (!userLdap) return;
+  db.prepare('DELETE FROM sessions WHERE user_ldap = ?').run(String(userLdap).toLowerCase());
+}
+
 export function syncDocumentFts(docRow) {
   if (!docRow || !docRow.doc_code) return;
   db.prepare('DELETE FROM documents_fts WHERE doc_code = ?').run(docRow.doc_code);
@@ -378,6 +591,7 @@ export function syncDocumentFts(docRow) {
     docRow.source_system || '',
     docRow.category || ''
   );
+  syncDocumentEmbedding(docRow);
 }
 
 export function rebuildDocumentsFts() {
@@ -1887,12 +2101,396 @@ export function getOrgChartForUser(ldap, revealPii = false) {
     directReports,
     ownedGoLinks,
     authoredDocs,
+    kudosReceived: listKudos(target.ldap, 10),
   };
+}
+
+/**
+ * SCIM 2.0 User Provisioning & Lifecycle Synchronization (Okta / Microsoft Entra ID / Workday)
+ */
+function toScimResource(row) {
+  const nameParts = String(row.full_name || '').trim().split(/\s+/);
+  const givenName = nameParts[0] || row.ldap;
+  const familyName = nameParts.slice(1).join(' ') || '';
+  return {
+    schemas: [
+      'urn:ietf:params:scim:schemas:core:2.0:User',
+      'urn:ietf:params:scim:schemas:extension:enterprise:2.0:User',
+    ],
+    id: row.ldap,
+    externalId: row.ldap,
+    userName: row.email,
+    active: Boolean(row.active),
+    name: {
+      formatted: row.full_name,
+      givenName,
+      familyName,
+    },
+    title: row.title,
+    emails: [{ value: row.email, primary: true, type: 'work' }],
+    groups: JSON.parse(row.groups_json || '[]').map((g) => ({ value: g, display: g })),
+    'urn:ietf:params:scim:schemas:extension:enterprise:2.0:User': {
+      department: row.department,
+      costCenter: row.cost_center,
+      organization: row.team,
+      manager: row.manager_ldap ? { value: row.manager_ldap } : null,
+    },
+  };
+}
+
+export function listScimUsers() {
+  const rows = db.prepare('SELECT * FROM users ORDER BY id ASC').all();
+  const resources = rows.map(toScimResource);
+  return {
+    schemas: ['urn:ietf:params:scim:api:messages:2.0:ListResponse'],
+    totalResults: resources.length,
+    startIndex: 1,
+    itemsPerPage: resources.length,
+    Resources: resources,
+  };
+}
+
+export function provisionScimUser(scimPayload, actorLdap = 'scim-idp', clientIp = '127.0.0.1') {
+  if (!scimPayload || typeof scimPayload !== 'object') {
+    throw new Error('Payload SCIM 2.0 invalide.');
+  }
+
+  const enterpriseExt =
+    scimPayload['urn:ietf:params:scim:schemas:extension:enterprise:2.0:User'] || {};
+  const rawEmail = String(
+    scimPayload.emails?.[0]?.value || scimPayload.userName || ''
+  )
+    .trim()
+    .toLowerCase();
+  const rawLdapCandidate = String(
+    scimPayload.externalId || scimPayload.ldap || rawEmail.split('@')[0] || ''
+  )
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9_-]/g, '')
+    .slice(0, 32);
+
+  if (!rawLdapCandidate || rawLdapCandidate.length < 2) {
+    throw new Error('SCIM userName / externalId requis (minimum 2 caractères).');
+  }
+
+  const email = rawEmail && rawEmail.includes('@') ? rawEmail : `${rawLdapCandidate}@corp.internal`;
+  const formattedName = String(
+    scimPayload.name?.formatted ||
+      [scimPayload.name?.givenName, scimPayload.name?.familyName].filter(Boolean).join(' ') ||
+      scimPayload.displayName ||
+      rawLdapCandidate
+  )
+    .trim()
+    .slice(0, 90);
+  const isActive = scimPayload.active !== false;
+
+  const allowedDepts = ['Executive', 'Engineering', 'Security', 'IT Operations', 'People Ops'];
+  const rawDept = String(enterpriseExt.department || scimPayload.department || 'Engineering').trim();
+  const safeDept = allowedDepts.includes(rawDept) ? rawDept : 'Engineering';
+
+  const allowedRoles = ['employee', 'hr_manager', 'security_admin', 'admin'];
+  const rawRole = String(scimPayload.role || 'employee').trim();
+  const safeRole = allowedRoles.includes(rawRole) ? rawRole : 'employee';
+
+  const title = String(scimPayload.title || 'Enterprise Specialist').trim().slice(0, 90);
+  const team = String(enterpriseExt.organization || scimPayload.team || `${safeDept} Team`).trim().slice(0, 80);
+  const managerLdap = enterpriseExt.manager?.value
+    ? String(enterpriseExt.manager.value).trim().toLowerCase().replace(/[^a-z0-9_-]/g, '')
+    : scimPayload.managerLdap
+      ? String(scimPayload.managerLdap).trim().toLowerCase().replace(/[^a-z0-9_-]/g, '')
+      : 'jassouline';
+  const office = String(scimPayload.locale || scimPayload.office || 'Paris — 8 Rue de Londres').trim().slice(0, 80);
+  const costCenter = String(enterpriseExt.costCenter || 'CC-300-SCIM').trim().slice(0, 40);
+  const groups = Array.isArray(scimPayload.groups)
+    ? scimPayload.groups.map((g) => String(typeof g === 'string' ? g : g?.value || '').trim()).filter(Boolean).slice(0, 12)
+    : [`${safeDept.toLowerCase().replace(/\s+/g, '-')}@corp.internal`];
+  const skills = Array.isArray(scimPayload.skills)
+    ? scimPayload.skills.map((s) => String(s).trim()).filter(Boolean).slice(0, 10)
+    : [safeDept, 'SCIM Provisioned'];
+
+  const existing = db.prepare('SELECT * FROM users WHERE ldap = ?').get(rawLdapCandidate);
+  let created = false;
+
+  if (existing) {
+    db.prepare(`
+      UPDATE users
+      SET full_name = ?, title = ?, department = ?, team = ?, manager_ldap = ?,
+          office = ?, email = ?, cost_center = ?, groups_json = ?, role = ?, active = ?
+      WHERE ldap = ?
+    `).run(
+      formattedName,
+      title,
+      safeDept,
+      team,
+      managerLdap || null,
+      office,
+      email,
+      costCenter,
+      JSON.stringify(groups),
+      safeRole,
+      isActive ? 1 : 0,
+      rawLdapCandidate
+    );
+  } else {
+    created = true;
+    const randomPass = `Scim!${crypto.randomBytes(18).toString('base64url')}`;
+    const { hash, salt } = hashPassword(randomPass);
+    db.prepare(`
+      INSERT INTO users (
+        ldap, full_name, title, level, department, team, manager_ldap,
+        office, desk_location, presence_status, presence_label, timezone, working_hours,
+        email, phone, cost_center, hire_date, avatar_color, badges_json, skills_json,
+        projects_json, groups_json, bio, role, password_hash, password_salt, active
+      ) VALUES (?, ?, ?, 'L5', ?, ?, ?, ?, 'Campus • Desk SCIM', 'available', 'Synchronisé SCIM 2.0', 'Europe/Paris (UTC+1)', '09:00 - 18:00', ?, '+33 1 40 00 00 00', ?, ?, '#1a73e8', '["SCIM Synced"]', ?, '["Onboarding"]', ?, ?, ?, ?, ?, ?)
+    `).run(
+      rawLdapCandidate,
+      formattedName,
+      title,
+      safeDept,
+      team,
+      managerLdap || null,
+      office,
+      email,
+      costCenter,
+      new Date().toISOString().slice(0, 10),
+      JSON.stringify(skills),
+      JSON.stringify(groups),
+      `Collaborateur synchronisé automatiquement via le connecteur SCIM 2.0 (${safeDept}).`,
+      safeRole,
+      hash,
+      salt,
+      isActive ? 1 : 0
+    );
+  }
+
+  // Mandatory security control: immediately revoke all active sessions when an account is deactivated
+  if (!isActive) {
+    deleteAllUserDbSessions(rawLdapCandidate);
+  }
+
+  recordAuditLog({
+    actorLdap,
+    action: isActive ? 'SCIM_PROVISION' : 'SCIM_DEACTIVATE',
+    targetType: 'user',
+    targetKey: rawLdapCandidate,
+    metadata: { created, active: isActive, department: safeDept, role: safeRole },
+    clientIp,
+  });
+
+  const savedRow = db.prepare('SELECT * FROM users WHERE ldap = ?').get(rawLdapCandidate);
+  return { created, resource: toScimResource(savedRow) };
+}
+
+/**
+ * Peer Kudos / Peer Bonus ("go/kudos" Moma Culture Feature)
+ */
+export function listKudos(targetLdap = '', limit = 15) {
+  const safeLimit = Math.min(Math.max(Number(limit) || 15, 1), 100);
+  const cleanTarget = String(targetLdap || '').trim().toLowerCase();
+  const rows = cleanTarget
+    ? db
+        .prepare('SELECT * FROM kudos WHERE to_ldap = ? ORDER BY id DESC LIMIT ?')
+        .all(cleanTarget, safeLimit)
+    : db.prepare('SELECT * FROM kudos ORDER BY id DESC LIMIT ?').all(safeLimit);
+
+  return rows.map((k) => {
+    const sender = getUserByLdap(k.from_ldap, false);
+    const receiver = getUserByLdap(k.to_ldap, false);
+    return {
+      id: k.id,
+      fromLdap: k.from_ldap,
+      fromName: sender?.fullName || `@${k.from_ldap}`,
+      toLdap: k.to_ldap,
+      toName: receiver?.fullName || `@${k.to_ldap}`,
+      badgeType: k.badge_type,
+      message: k.message,
+      points: k.points,
+      createdAt: k.created_at,
+    };
+  });
+}
+
+export function sendPeerKudo(payload, currentUser) {
+  if (!currentUser) {
+    throw new Error('Authentification requise.');
+  }
+  const toLdap = String(payload?.toLdap || '').trim().toLowerCase();
+  if (!toLdap) {
+    throw new Error('Veuillez sélectionner le collaborateur destinataire.');
+  }
+  if (toLdap === currentUser.ldap) {
+    throw new Error('Vous ne pouvez pas vous envoyer un Peer Kudo à vous-même.');
+  }
+  const recipient = getUserByLdap(toLdap, false);
+  if (!recipient) {
+    throw new Error(`Collaborateur @${toLdap} introuvable ou inactif.`);
+  }
+  const allowedBadges = [
+    'Excellence Technique',
+    'Esprit d’Équipe',
+    'Impact Client',
+    'Sécurité & Fiabilité',
+  ];
+  const rawBadge = String(payload?.badgeType || 'Excellence Technique').trim();
+  const safeBadge = allowedBadges.includes(rawBadge) ? rawBadge : 'Excellence Technique';
+  const cleanMsg = String(payload?.message || '').trim().slice(0, 320);
+  if (cleanMsg.length < 5) {
+    throw new Error('Le message de reconnaissance doit contenir au moins 5 caractères.');
+  }
+  const safePoints = Math.min(Math.max(Number(payload?.points) || 50, 25), 200);
+  const nowIso = new Date().toISOString();
+
+  const res = db
+    .prepare(
+      'INSERT INTO kudos (from_ldap, to_ldap, badge_type, message, points, created_at) VALUES (?, ?, ?, ?, ?, ?)'
+    )
+    .run(currentUser.ldap, recipient.ldap, safeBadge, cleanMsg, safePoints, nowIso);
+
+  recordAuditLog({
+    actorLdap: currentUser.ldap,
+    action: 'PEER_KUDO_SENT',
+    targetType: 'person',
+    targetKey: recipient.ldap,
+    metadata: { badgeType: safeBadge, points: safePoints },
+  });
+
+  return listKudos(recipient.ldap, 5).find((k) => k.id === Number(res.lastInsertRowid)) || listKudos(recipient.ldap, 1)[0];
+}
+
+/**
+ * Personalized Pinned go/links ("My Moma" Favorites)
+ */
+export function listUserPinnedSlugs(userLdap) {
+  if (!userLdap) return [];
+  return db
+    .prepare('SELECT slug FROM user_pins WHERE user_ldap = ? ORDER BY created_at DESC')
+    .all(String(userLdap).toLowerCase())
+    .map((r) => r.slug);
+}
+
+export function toggleUserPin(rawSlug, currentUser) {
+  if (!currentUser) {
+    throw new Error('Authentification requise.');
+  }
+  const cleanSlug = String(rawSlug || '')
+    .trim()
+    .toLowerCase()
+    .replace(/^go\//, '');
+  const goRow = db.prepare('SELECT slug FROM go_links WHERE slug = ?').get(cleanSlug);
+  if (!goRow) {
+    throw new Error(`Le raccourci go/${cleanSlug} est introuvable.`);
+  }
+  const existing = db
+    .prepare('SELECT 1 FROM user_pins WHERE user_ldap = ? AND slug = ?')
+    .get(currentUser.ldap, cleanSlug);
+  let pinned = false;
+  if (existing) {
+    db.prepare('DELETE FROM user_pins WHERE user_ldap = ? AND slug = ?').run(currentUser.ldap, cleanSlug);
+    pinned = false;
+  } else {
+    db.prepare('INSERT INTO user_pins (user_ldap, slug, created_at) VALUES (?, ?, ?)').run(
+      currentUser.ldap,
+      cleanSlug,
+      new Date().toISOString()
+    );
+    pinned = true;
+  }
+  return {
+    slug: cleanSlug,
+    pinned,
+    pinnedSlugs: listUserPinnedSlugs(currentUser.ldap),
+  };
+}
+
+/**
+ * Full Document Reader & Freshness / Outdated Flagging (g3doc style, ACL-enforced)
+ */
+export function getDocumentByCode(rawDocCode, currentUser) {
+  const cleanCode = String(rawDocCode || '').trim().toUpperCase();
+  const row = db.prepare('SELECT * FROM documents WHERE doc_code = ?').get(cleanCode);
+  if (!row) {
+    const notFound = new Error('Document introuvable.');
+    notFound.statusCode = 404;
+    throw notFound;
+  }
+  if (!canUserAccessDocument(currentUser, row)) {
+    const forbidden = new Error(
+      `Accès refusé (ACL Trimming) : votre profil @${currentUser?.ldap || 'anonymous'} n’est pas habilité à lire ${cleanCode}.`
+    );
+    forbidden.statusCode = 403;
+    throw forbidden;
+  }
+  return {
+    docCode: row.doc_code,
+    connectorKey: row.connector_key,
+    title: row.title,
+    summary: row.summary,
+    content: row.content,
+    sourceSystem: row.source_system,
+    category: row.category,
+    ownerLdap: row.owner_ldap,
+    goLink: row.go_link,
+    tags: JSON.parse(row.tags_json || '[]'),
+    visibilityDept: row.visibility_dept,
+    minRole: row.min_role,
+    updatedAt: row.updated_at,
+    outdatedFlagged: Boolean(row.outdated_flagged),
+    outdatedReason: row.outdated_reason || null,
+    outdatedByLdap: row.outdated_by_ldap || null,
+  };
+}
+
+export function flagDocumentOutdated(payload, currentUser) {
+  if (!currentUser) {
+    throw new Error('Authentification requise.');
+  }
+  const doc = getDocumentByCode(payload?.docCode, currentUser);
+  const clearFlag = payload?.clear === true && (currentUser.ldap === doc.ownerLdap || currentUser.role === 'admin');
+  if (clearFlag) {
+    db.prepare(
+      'UPDATE documents SET outdated_flagged = 0, outdated_reason = NULL, outdated_by_ldap = NULL, updated_at = ? WHERE doc_code = ?'
+    ).run(new Date().toISOString().slice(0, 10), doc.docCode);
+    recordAuditLog({
+      actorLdap: currentUser.ldap,
+      action: 'DOC_FRESHNESS_VERIFIED',
+      targetType: 'document',
+      targetKey: doc.docCode,
+    });
+    return getDocumentByCode(doc.docCode, currentUser);
+  }
+
+  const cleanReason = String(payload?.reason || 'Mise à jour requise signalée par un collaborateur.')
+    .trim()
+    .slice(0, 240);
+  db.prepare(
+    'UPDATE documents SET outdated_flagged = 1, outdated_reason = ?, outdated_by_ldap = ? WHERE doc_code = ?'
+  ).run(cleanReason, currentUser.ldap, doc.docCode);
+
+  recordAuditLog({
+    actorLdap: currentUser.ldap,
+    action: 'DOC_FLAGGED_OUTDATED',
+    targetType: 'document',
+    targetKey: doc.docCode,
+    metadata: { reason: cleanReason, ownerLdap: doc.ownerLdap },
+  });
+
+  return getDocumentByCode(doc.docCode, currentUser);
 }
 
 /**
  * Connectors & Custom Enterprise Tool Integration APIs
  */
+export function getConnectorRaw(connectorKey) {
+  return db
+    .prepare('SELECT * FROM connectors WHERE connector_key = ?')
+    .get(String(connectorKey || '').trim().toLowerCase());
+}
+
+export function listConnectorsRawEnabled() {
+  return db.prepare('SELECT * FROM connectors WHERE enabled = 1').all();
+}
+
 export function listConnectors() {
   const rows = db.prepare('SELECT * FROM connectors ORDER BY is_custom DESC, id ASC').all();
   const docCounts = db.prepare('SELECT connector_key, COUNT(*) AS cnt FROM documents GROUP BY connector_key').all();
@@ -1910,6 +2508,8 @@ export function listConnectors() {
     category: r.category,
     protocol: r.protocol,
     baseUrl: r.base_url,
+    liveEndpointUrl: r.live_endpoint_url || null,
+    approvalWebhookUrl: r.approval_webhook_url || null,
     oneboxTrigger: r.onebox_trigger,
     aclMode: r.acl_mode,
     visibilityDept: r.visibility_dept,
@@ -1950,6 +2550,40 @@ export function toggleConnectorState(connectorKey, currentUser) {
   return listConnectors().find((c) => c.connectorKey === cleanKey);
 }
 
+export function configureConnectorOutboundUrls(payload, currentUser) {
+  if (!currentUser || currentUser.role !== 'admin') {
+    const err = new Error('Seul un administrateur peut configurer les webhooks sortants d’un connecteur.');
+    err.statusCode = 403;
+    throw err;
+  }
+  const cleanKey = String(payload?.connectorKey || '').trim().toLowerCase();
+  const existing = db.prepare('SELECT * FROM connectors WHERE connector_key = ?').get(cleanKey);
+  if (!existing) {
+    const notFound = new Error('Connecteur introuvable.');
+    notFound.statusCode = 404;
+    throw notFound;
+  }
+  const safeLiveUrl = payload?.liveEndpointUrl
+    ? validateOutboundUrlSyntax(payload.liveEndpointUrl)
+    : null;
+  const safeWebhookUrl = payload?.approvalWebhookUrl
+    ? validateOutboundUrlSyntax(payload.approvalWebhookUrl)
+    : null;
+
+  db.prepare(
+    'UPDATE connectors SET live_endpoint_url = ?, approval_webhook_url = ?, last_sync_at = ? WHERE connector_key = ?'
+  ).run(safeLiveUrl, safeWebhookUrl, 'Endpoints sortants mis à jour', cleanKey);
+
+  recordAuditLog({
+    actorLdap: currentUser.ldap,
+    action: 'CONNECTOR_ENDPOINTS_UPDATED',
+    targetType: 'connector',
+    targetKey: cleanKey,
+    metadata: { hasLiveEndpoint: Boolean(safeLiveUrl), hasApprovalWebhook: Boolean(safeWebhookUrl) },
+  });
+  return listConnectors().find((c) => c.connectorKey === cleanKey);
+}
+
 export function registerCustomToolConnector(payload, currentUser) {
   if (!currentUser) {
     throw new Error('Authentification requise.');
@@ -1982,6 +2616,14 @@ export function registerCustomToolConnector(payload, currentUser) {
     payload.oneboxMetricValue || 'Connecté en temps réel (Webhook & Index ACL actifs)'
   ).trim();
 
+  // Validate optional live outbound endpoints against SSRF rules at registration time
+  const safeLiveEndpointUrl = payload.liveEndpointUrl
+    ? validateOutboundUrlSyntax(payload.liveEndpointUrl)
+    : null;
+  const safeApprovalWebhookUrl = payload.approvalWebhookUrl
+    ? validateOutboundUrlSyntax(payload.approvalWebhookUrl)
+    : null;
+
   if (name.length < 2 || name.length > 90) {
     throw new Error('Le nom de l’outil doit contenir entre 2 et 90 caractères.');
   }
@@ -2007,8 +2649,9 @@ export function registerCustomToolConnector(payload, currentUser) {
   db.prepare(`
     INSERT INTO connectors (
       connector_key, name, vendor, category, protocol, base_url,
+      live_endpoint_url, approval_webhook_url,
       onebox_trigger, acl_mode, visibility_dept, enabled, is_custom, owner_ldap, last_sync_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 1, ?, 'Synchronisé à l’instant (Custom SDK)')
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 1, ?, 'Synchronisé à l’instant (Custom SDK)')
   `).run(
     rawKey,
     name,
@@ -2016,6 +2659,8 @@ export function registerCustomToolConnector(payload, currentUser) {
     category,
     protocol,
     parsedUrl.toString(),
+    safeLiveEndpointUrl,
+    safeApprovalWebhookUrl,
     oneboxTrigger,
     safeDept === 'ALL' ? 'Identity-Aware (Tous les collaborateurs)' : `ACL Restreinte (${safeDept})`,
     safeDept,
@@ -2096,7 +2741,12 @@ export function registerCustomToolConnector(payload, currentUser) {
     action: 'CONNECTOR_REGISTER',
     targetType: 'connector',
     targetKey: rawKey,
-    metadata: { vendor, visibilityDept: safeDept },
+    metadata: {
+      vendor,
+      visibilityDept: safeDept,
+      hasLiveEndpoint: Boolean(safeLiveEndpointUrl),
+      hasApprovalWebhook: Boolean(safeApprovalWebhookUrl),
+    },
   });
 
   return listConnectors().find((c) => c.connectorKey === rawKey);
@@ -2840,7 +3490,7 @@ function parseMomaQueryOperators(rawQuery) {
  * - Moma OneBox Real-Time Structured Cards
  * - Documents, People (Teams), go/links, and IT/ERP Tickets
  */
-export function executeFederatedSearch(rawQuery, currentUser, facet = 'all') {
+export function executeFederatedSearch(rawQuery, currentUser, facet = 'all', queryEmbeddingObj = null) {
   const { cleanQuery, filters } = parseMomaQueryOperators(rawQuery);
   const query = cleanQuery;
   const normalized = query.toLowerCase();
@@ -2952,7 +3602,7 @@ export function executeFederatedSearch(rawQuery, currentUser, facet = 'all') {
     }
   }
 
-  // 1. Search Documents with SQLite FTS5 BM25 ranking + Connector status check + Operator filters + strict ACL trimming
+  // 1. Hybrid Document Retrieval: SQLite FTS5 BM25 + Semantic Vector Embeddings fused with Reciprocal Rank Fusion (RRF)
   const ftsScoreByDocCode = new Map();
   if (tokens.length > 0) {
     const ftsTokens = tokens
@@ -2965,7 +3615,6 @@ export function executeFederatedSearch(rawQuery, currentUser, facet = 'all') {
           .prepare('SELECT doc_code, bm25(documents_fts) AS rank FROM documents_fts WHERE documents_fts MATCH ?')
           .all(ftsMatchExpr);
         for (const r of ftsRows) {
-          // SQLite bm25() returns negative scores where lower (more negative) is more relevant
           const boost = Math.max(4, Math.round(Math.abs(Number(r.rank) || 1) * 10));
           ftsScoreByDocCode.set(r.doc_code, boost);
         }
@@ -2975,60 +3624,134 @@ export function executeFederatedSearch(rawQuery, currentUser, facet = 'all') {
     }
   }
 
+  const localQueryVec = query.length >= 2 ? computeLocalSemanticEmbedding(query) : null;
+  const embeddingRows = db.prepare('SELECT doc_code, model, vector_json FROM document_embeddings').all();
+  const embeddingMap = new Map();
+  for (const er of embeddingRows) {
+    try {
+      embeddingMap.set(er.doc_code, {
+        model: er.model,
+        vector: JSON.parse(er.vector_json),
+      });
+    } catch {
+      // Ignore malformed vector row
+    }
+  }
+
   const allDocs = db.prepare('SELECT * FROM documents ORDER BY updated_at DESC').all();
   let aclFilteredOutCount = 0;
   let disabledConnectorSkippedCount = 0;
-  const matchedDocs = [];
+  const authorizedDocCandidates = [];
 
   for (const doc of allDocs) {
     if (filters.owner && doc.owner_ldap.toLowerCase() !== filters.owner) continue;
     if (filters.source && !doc.connector_key.toLowerCase().includes(filters.source)) continue;
 
     const haystack = `${doc.doc_code} ${doc.title} ${doc.summary} ${doc.content} ${doc.source_system} ${doc.category} ${doc.go_link || ''} ${doc.tags_json}`.toLowerCase();
-    let score = 0;
+    let lexicalScore = 0;
     if (!query && (filters.owner || filters.source || filters.type)) {
-      score = 5;
+      lexicalScore = 5;
     } else if (!query) {
-      score = 1;
+      lexicalScore = 1;
     } else {
       if (ftsScoreByDocCode.has(doc.doc_code)) {
-        score += ftsScoreByDocCode.get(doc.doc_code);
+        lexicalScore += ftsScoreByDocCode.get(doc.doc_code);
       }
-      if (haystack.includes(normalized)) score += 10;
+      if (haystack.includes(normalized)) lexicalScore += 10;
       for (const tok of tokens) {
-        if (doc.title.toLowerCase().includes(tok)) score += 5;
-        if (doc.tags_json.toLowerCase().includes(tok)) score += 4;
-        if (haystack.includes(tok)) score += 2;
+        if (doc.title.toLowerCase().includes(tok)) lexicalScore += 5;
+        if (doc.tags_json.toLowerCase().includes(tok)) lexicalScore += 4;
+        if (haystack.includes(tok)) lexicalScore += 2;
       }
     }
 
-    if (score > 0) {
+    let semanticSim = 0;
+    if (query.length >= 2) {
+      const storedEmb = embeddingMap.get(doc.doc_code);
+      if (
+        queryEmbeddingObj &&
+        storedEmb &&
+        storedEmb.model === queryEmbeddingObj.model &&
+        Array.isArray(queryEmbeddingObj.vector)
+      ) {
+        semanticSim = cosineSimilarity(queryEmbeddingObj.vector, storedEmb.vector);
+      } else if (localQueryVec) {
+        const docLocalVec =
+          storedEmb && storedEmb.model === 'local-semantic-v1'
+            ? storedEmb.vector
+            : computeLocalSemanticEmbedding(
+                `${doc.title} ${doc.summary} ${doc.content} ${doc.tags_json} ${doc.category}`
+              );
+        semanticSim = cosineSimilarity(localQueryVec, docLocalVec);
+      }
+    }
+
+    const hasLexical = lexicalScore > 0;
+    const hasSemantic = query.length >= 2 && semanticSim >= 0.25;
+
+    if (hasLexical || hasSemantic) {
       if (!enabledConnectors.has(doc.connector_key)) {
         disabledConnectorSkippedCount += 1;
         continue;
       }
       if (canUserAccessDocument(currentUser, doc)) {
-        matchedDocs.push({
-          docCode: doc.doc_code,
-          connectorKey: doc.connector_key,
-          title: doc.title,
-          summary: doc.summary,
-          content: doc.content,
-          sourceSystem: doc.source_system,
-          category: doc.category,
-          ownerLdap: doc.owner_ldap,
-          goLink: doc.go_link,
-          tags: JSON.parse(doc.tags_json || '[]'),
-          visibilityDept: doc.visibility_dept,
-          updatedAt: doc.updated_at,
-          score,
+        authorizedDocCandidates.push({
+          doc,
+          lexicalScore,
+          semanticSim: Number(semanticSim.toFixed(4)),
+          hasLexical,
+          hasSemantic,
         });
       } else {
         aclFilteredOutCount += 1;
       }
     }
   }
-  matchedDocs.sort((a, b) => b.score - a.score);
+
+  // Compute Reciprocal Rank Fusion (RRF) across BM25/Lexical rank and Vector Cosine Similarity rank
+  const lexSorted = authorizedDocCandidates
+    .filter((c) => c.hasLexical)
+    .sort((a, b) => b.lexicalScore - a.lexicalScore);
+  const semSorted = authorizedDocCandidates
+    .filter((c) => c.hasSemantic)
+    .sort((a, b) => b.semanticSim - a.semanticSim);
+
+  const lexRankMap = new Map(lexSorted.map((c, idx) => [c.doc.doc_code, idx + 1]));
+  const semRankMap = new Map(semSorted.map((c, idx) => [c.doc.doc_code, idx + 1]));
+
+  const matchedDocs = authorizedDocCandidates.map((c) => {
+    const lRank = lexRankMap.get(c.doc.doc_code) || null;
+    const sRank = semRankMap.get(c.doc.doc_code) || null;
+    const rrfScore = computeRrfScore(lRank, sRank);
+    const matchMode =
+      c.hasLexical && c.hasSemantic
+        ? 'hybrid-rrf'
+        : c.hasSemantic
+          ? 'semantic-vector'
+          : 'lexical-bm25';
+    return {
+      docCode: c.doc.doc_code,
+      connectorKey: c.doc.connector_key,
+      title: c.doc.title,
+      summary: c.doc.summary,
+      content: c.doc.content,
+      sourceSystem: c.doc.source_system,
+      category: c.doc.category,
+      ownerLdap: c.doc.owner_ldap,
+      goLink: c.doc.go_link,
+      tags: JSON.parse(c.doc.tags_json || '[]'),
+      visibilityDept: c.doc.visibility_dept,
+      updatedAt: c.doc.updated_at,
+      outdatedFlagged: Boolean(c.doc.outdated_flagged),
+      outdatedReason: c.doc.outdated_reason || null,
+      outdatedByLdap: c.doc.outdated_by_ldap || null,
+      score: rrfScore,
+      lexicalScore: c.lexicalScore,
+      semanticSimilarity: c.semanticSim,
+      matchMode,
+    };
+  });
+  matchedDocs.sort((a, b) => b.score - a.score || b.lexicalScore - a.lexicalScore);
 
   // 2. Search People (Teams directory)
   const allUsers = db.prepare('SELECT * FROM users WHERE active = 1').all();
@@ -3056,6 +3779,7 @@ export function executeFederatedSearch(rawQuery, currentUser, facet = 'all') {
   matchedPeople.sort((a, b) => b.score - a.score);
 
   // 3. Search go/links
+  const pinnedSet = new Set(listUserPinnedSlugs(currentUser?.ldap));
   const allGoLinks = db.prepare('SELECT * FROM go_links ORDER BY hits DESC').all();
   const matchedGoLinks = [];
   for (const g of allGoLinks) {
@@ -3075,7 +3799,7 @@ export function executeFederatedSearch(rawQuery, currentUser, facet = 'all') {
       }
     }
     if (score > 0) {
-      matchedGoLinks.push({ ...g, score });
+      matchedGoLinks.push({ ...g, isPinned: pinnedSet.has(g.slug), score });
     }
   }
   matchedGoLinks.sort((a, b) => b.score - a.score || b.hits - a.hits);
@@ -3110,6 +3834,7 @@ export function executeFederatedSearch(rawQuery, currentUser, facet = 'all') {
 
   return {
     query: rawQuery,
+    rankingEngine: queryEmbeddingObj?.model || 'hybrid-fts5-bm25+vector-rrf',
     appliedFilters: filters,
     operators: {
       owner: filters.owner,
@@ -3144,8 +3869,20 @@ export function executeFederatedSearch(rawQuery, currentUser, facet = 'all') {
 }
 
 export function getDashboardWidgets(currentUser) {
+  const userLdap = currentUser?.ldap || '';
+  const pinnedSlugs = listUserPinnedSlugs(userLdap);
+  const pinnedSet = new Set(pinnedSlugs);
+
   const announcements = db.prepare('SELECT * FROM announcements ORDER BY id ASC').all();
-  const topGoLinks = db.prepare('SELECT * FROM go_links ORDER BY hits DESC LIMIT 8').all();
+  const topGoLinks = db
+    .prepare('SELECT * FROM go_links ORDER BY hits DESC LIMIT 8')
+    .all()
+    .map((g) => ({ ...g, isPinned: pinnedSet.has(g.slug) }));
+  const pinnedGoLinks = pinnedSlugs
+    .map((slug) => db.prepare('SELECT * FROM go_links WHERE slug = ?').get(slug))
+    .filter(Boolean)
+    .map((g) => ({ ...g, isPinned: true }));
+
   const connectors = listConnectors();
   const enabledKeys = new Set(connectors.filter((c) => c.enabled).map((c) => c.connectorKey));
 
@@ -3171,11 +3908,12 @@ export function getDashboardWidgets(currentUser) {
       goLink: d.go_link,
       visibilityDept: d.visibility_dept,
       updatedAt: d.updated_at,
+      outdatedFlagged: Boolean(d.outdated_flagged),
+      outdatedReason: d.outdated_reason || null,
     }));
 
   // Personalized "My Moma" Widgets:
   // 1. Pending Approvals filtered strictly to current user (approver or requester) or Platform/Exec Admin
-  const userLdap = currentUser?.ldap || '';
   const isAdmin = currentUser?.role === 'admin';
   const pendingApprovals = db
     .prepare('SELECT * FROM approvals ORDER BY id ASC')
@@ -3234,10 +3972,13 @@ export function getDashboardWidgets(currentUser) {
       }
     : null;
   const allCampusMenus = db.prepare('SELECT * FROM campus_menus ORDER BY id ASC').all();
+  const recentKudos = listKudos('', 5);
 
   return {
     announcements,
     topGoLinks,
+    pinnedGoLinks,
+    pinnedSlugs,
     recentTickets,
     accessibleDocs,
     connectors,
@@ -3246,6 +3987,8 @@ export function getDashboardWidgets(currentUser) {
     meetings,
     campusMenu,
     allCampusMenus,
+    recentKudos,
   };
 }
+
 

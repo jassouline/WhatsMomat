@@ -16,6 +16,7 @@ const appState = {
   lastSearchPayload: null,
   askMomaTurns: [],
   lastInteractionId: null,
+  pinnedSlugs: [],
 };
 
 /**
@@ -224,6 +225,7 @@ function renderQuickQueryChips() {
   const container = document.getElementById('quickQueryChips');
   if (!container) return;
   const examples = [
+    { label: 'Hybride Vecteur RRF (Zéro mot-clé exact)', query: 'fauteuil mal de dos maison' },
     { label: 'whatis:GRAD (Décodeur Jargon)', query: 'whatis:GRAD' },
     { label: 'whatis:TGIF (Culture)', query: 'whatis:TGIF' },
     { label: 'owner:sophiel (Opérateur Owner)', query: 'owner:sophiel' },
@@ -437,20 +439,60 @@ async function loadDashboard() {
     }
   }
 
-  // 5. Render top go/links
+  // 5. Render pinned go/links + top go/links
+  appState.pinnedSlugs = data.pinnedSlugs || [];
+  const pinnedStrip = document.getElementById('dashboardPinnedGoLinks');
+  if (pinnedStrip) {
+    pinnedStrip.replaceChildren();
+    const pinnedList = data.pinnedGoLinks || [];
+    if (pinnedList.length > 0) {
+      pinnedStrip.classList.remove('hidden');
+      pinnedStrip.appendChild(el('span', { className: 'info-label', text: '★ Épinglés :' }));
+      for (const pg of pinnedList) {
+        pinnedStrip.appendChild(
+          el(
+            'button',
+            {
+              className: 'pinned-pill',
+              attrs: { type: 'button', title: pg.title },
+              onClick: () => triggerGoLinkResolution(pg.slug),
+            },
+            [`★ go/${pg.slug}`]
+          )
+        );
+      }
+    } else {
+      pinnedStrip.classList.add('hidden');
+    }
+  }
+
   const goGrid = document.getElementById('dashboardGoLinksGrid');
   if (goGrid) {
     goGrid.replaceChildren();
     for (const g of data.topGoLinks || []) {
       const card = el(
-        'button',
+        'div',
         {
           className: 'golink-card-mini',
-          attrs: { type: 'button' },
-          onClick: () => triggerGoLinkResolution(g.slug),
         },
         [
-          el('div', { className: 'golink-slug', text: `go/${g.slug}` }),
+          el('div', { className: 'doc-item-header' }, [
+            el('button', {
+              className: 'btn-link golink-slug',
+              text: `go/${g.slug}`,
+              attrs: { type: 'button' },
+              onClick: () => triggerGoLinkResolution(g.slug),
+            }),
+            el('button', {
+              className: g.isPinned ? 'pin-btn pinned' : 'pin-btn',
+              text: g.isPinned ? '★' : '☆',
+              attrs: {
+                type: 'button',
+                title: g.isPinned ? 'Désépingler de My Moma' : 'Épingler sur My Moma',
+              },
+              onClick: () => handleTogglePin(g.slug),
+            }),
+          ]),
           el('div', { className: 'golink-mini-title', text: g.title }),
           el('div', {
             className: 'golink-mini-meta',
@@ -459,6 +501,31 @@ async function loadDashboard() {
         ]
       );
       goGrid.appendChild(card);
+    }
+  }
+
+  // 5b. Render Peer Kudos (go/kudos)
+  const kudosList = document.getElementById('dashboardKudosList');
+  if (kudosList) {
+    kudosList.replaceChildren();
+    for (const k of data.recentKudos || []) {
+      kudosList.appendChild(
+        el('div', { className: 'kudos-item' }, [
+          el('div', { className: 'kudos-header' }, [
+            el('span', { className: 'badge badge-amber', text: `★ ${k.badgeType} (+${k.points})` }),
+            el('button', {
+              className: 'btn-link',
+              text: `@${k.fromLdap} → @${k.toLdap}`,
+              attrs: { type: 'button' },
+              onClick: () => {
+                appState.selectedPersonLdap = k.toLdap;
+                switchView('teams');
+              },
+            }),
+          ]),
+          el('div', { className: 'kudos-message', text: k.message }),
+        ])
+      );
     }
   }
 
@@ -520,8 +587,131 @@ async function loadDashboard() {
   }
 }
 
+async function handleTogglePin(slug) {
+  try {
+    const res = await apiFetch('/api/pins/toggle', {
+      method: 'POST',
+      body: { slug },
+    });
+    appState.pinnedSlugs = res.pinnedSlugs || [];
+    showToast(
+      res.pinned
+        ? `Raccourci go/${res.slug} épinglé sur votre accueil My Moma.`
+        : `Raccourci go/${res.slug} retiré des épinglés.`
+    );
+    await loadDashboard();
+    if (appState.activeView === 'golinks') {
+      await loadGoLinksRegistry();
+    }
+  } catch (err) {
+    showToast(err.message);
+  }
+}
+
+function openSendKudosModal(defaultLdap = '') {
+  const recipientSelect = el('select', { className: 'form-select' });
+  const candidates = (appState.personas || []).filter(
+    (p) => !appState.currentUser || p.ldap !== appState.currentUser.ldap
+  );
+  if (candidates.length > 0) {
+    for (const p of candidates) {
+      const opt = el('option', {
+        text: `${p.fullName} (@${p.ldap}) — ${p.department}`,
+        attrs: { value: p.ldap },
+      });
+      if (p.ldap === defaultLdap) opt.selected = true;
+      recipientSelect.appendChild(opt);
+    }
+  } else {
+    recipientSelect.appendChild(
+      el('option', {
+        text: defaultLdap ? `@${defaultLdap}` : '@sophiel',
+        attrs: { value: defaultLdap || 'sophiel' },
+      })
+    );
+  }
+
+  const badgeSelect = el('select', { className: 'form-select' }, [
+    el('option', { text: 'Excellence Technique', attrs: { value: 'Excellence Technique' } }),
+    el('option', { text: 'Esprit d’Équipe', attrs: { value: 'Esprit d’Équipe' } }),
+    el('option', { text: 'Impact Client', attrs: { value: 'Impact Client' } }),
+    el('option', { text: 'Sécurité & Fiabilité', attrs: { value: 'Sécurité & Fiabilité' } }),
+  ]);
+
+  const pointsSelect = el('select', { className: 'form-select' }, [
+    el('option', { text: '50 points Peer Bonus', attrs: { value: '50' } }),
+    el('option', { text: '100 points Spot Kudos', attrs: { value: '100' } }),
+    el('option', { text: '150 points Impact Exceptionnel', attrs: { value: '150' } }),
+  ]);
+
+  const msgInput = el('textarea', {
+    className: 'form-textarea',
+    attrs: {
+      rows: '3',
+      placeholder: 'Remerciez ce collaborateur pour une aide concrète, un incident résolu ou un partage de connaissance...',
+      required: 'required',
+    },
+  });
+
+  const form = el('form', { className: 'golink-form' }, [
+    el('label', { className: 'form-label', text: 'Collaborateur destinataire' }),
+    recipientSelect,
+    el('label', { className: 'form-label', text: 'Badge culturel Moma' }),
+    badgeSelect,
+    el('label', { className: 'form-label', text: 'Points Peer Bonus' }),
+    pointsSelect,
+    el('label', { className: 'form-label', text: 'Message public de reconnaissance' }),
+    msgInput,
+    el('button', {
+      className: 'btn-primary btn-full btn-submit-spaced',
+      text: '★ Envoyer le Peer Kudos (go/kudos)',
+      attrs: { type: 'submit' },
+    }),
+  ]);
+
+  form.addEventListener('submit', async (ev) => {
+    ev.preventDefault();
+    try {
+      const res = await apiFetch('/api/kudos', {
+        method: 'POST',
+        body: {
+          toLdap: recipientSelect.value,
+          badgeType: badgeSelect.value,
+          points: Number(pointsSelect.value),
+          message: msgInput.value,
+        },
+      });
+      closeModal();
+      showToast(`Peer Kudos envoyé à @${res.kudo.toLdap} (+${res.kudo.points} pts) !`);
+      await loadDashboard();
+      if (appState.activeView === 'teams' && appState.selectedPersonLdap) {
+        await loadPersonOrgChart(appState.selectedPersonLdap, false);
+      }
+    } catch (err) {
+      showToast(err.message);
+    }
+  });
+
+  openModal('Reconnaissance Entre Pairs — Envoyer un Peer Kudos (go/kudos)', form);
+}
+
 function createDocumentCard(doc) {
   const isRestricted = doc.visibilityDept && doc.visibilityDept !== 'ALL';
+  const badges = [
+    el('span', {
+      className: isRestricted ? 'badge badge-red' : 'badge badge-teal',
+      text: isRestricted ? `ACL: ${doc.visibilityDept}` : doc.sourceSystem,
+    }),
+  ];
+  if (doc.matchMode === 'semantic-vector') {
+    badges.push(el('span', { className: 'match-mode-badge', text: 'Vecteur Sémantique' }));
+  } else if (doc.matchMode === 'hybrid-rrf') {
+    badges.push(el('span', { className: 'match-mode-badge', text: 'Hybride BM25+Vecteur RRF' }));
+  }
+  if (doc.outdatedFlagged) {
+    badges.push(el('span', { className: 'badge badge-amber', text: 'Obsolète signalé' }));
+  }
+
   return el('div', { className: 'doc-item' }, [
     el('div', { className: 'doc-item-header' }, [
       el('button', {
@@ -530,10 +720,7 @@ function createDocumentCard(doc) {
         attrs: { type: 'button' },
         onClick: () => showDocumentModal(doc),
       }),
-      el('span', {
-        className: isRestricted ? 'badge badge-red' : 'badge badge-teal',
-        text: isRestricted ? `ACL: ${doc.visibilityDept}` : doc.sourceSystem,
-      }),
+      el('div', { className: 'doc-badges-row' }, badges),
     ]),
     el('p', { className: 'doc-summary', text: doc.summary }),
     el('div', { className: 'doc-meta' }, [
@@ -559,30 +746,119 @@ function createDocumentCard(doc) {
   ]);
 }
 
-function showDocumentModal(doc) {
+async function showDocumentModal(docSummary) {
+  let doc = docSummary;
+  try {
+    const res = await apiFetch(`/api/documents/${encodeURIComponent(docSummary.docCode)}`);
+    if (res && res.document) {
+      doc = res.document;
+    }
+  } catch (err) {
+    showToast(err.message);
+    return;
+  }
+
+  const canVerifyFreshness =
+    appState.currentUser &&
+    (appState.currentUser.ldap === doc.ownerLdap || appState.currentUser.role === 'admin');
+
+  const freshnessBanner = doc.outdatedFlagged
+    ? el('div', { className: 'freshness-banner' }, [
+        el('strong', { text: 'Fraîcheur documentaire (g3doc) : ' }),
+        el('span', {
+          text: `Signalé comme potentiellement obsolète par @${doc.outdatedByLdap || 'collaborateur'} — « ${doc.outdatedReason || 'Vérification requise'} ». `,
+        }),
+        canVerifyFreshness
+          ? el('button', {
+              className: 'btn-secondary btn-sm',
+              text: '✓ Marquer comme vérifié à jour',
+              attrs: { type: 'button' },
+              onClick: async () => {
+                try {
+                  const res = await apiFetch('/api/documents/flag-outdated', {
+                    method: 'POST',
+                    body: { docCode: doc.docCode, clear: true },
+                  });
+                  showToast(`Document ${doc.docCode} confirmé à jour.`);
+                  await loadDashboard();
+                  if (appState.activeQuery) {
+                    await runFederatedSearch(appState.activeQuery, appState.activeFacet);
+                  }
+                  showDocumentModal(res.document);
+                } catch (err) {
+                  showToast(err.message);
+                }
+              },
+            })
+          : null,
+      ])
+    : null;
+
+  const reasonInput = el('input', {
+    className: 'form-input',
+    attrs: {
+      type: 'text',
+      placeholder: 'Précisez la section obsolète pour le propriétaire @' + doc.ownerLdap + '...',
+    },
+  });
+
+  const flagForm = el('form', { className: 'doc-flag-form' }, [
+    reasonInput,
+    el('button', {
+      className: 'btn-secondary btn-sm',
+      text: 'Signaler comme obsolète',
+      attrs: { type: 'submit' },
+    }),
+  ]);
+
+  flagForm.addEventListener('submit', async (ev) => {
+    ev.preventDefault();
+    try {
+      const res = await apiFetch('/api/documents/flag-outdated', {
+        method: 'POST',
+        body: {
+          docCode: doc.docCode,
+          reason: reasonInput.value.trim() || 'Mise à jour documentaire demandée.',
+        },
+      });
+      showToast(`Signalement envoyé à @${doc.ownerLdap} pour ${doc.docCode}.`);
+      await loadDashboard();
+      if (appState.activeQuery) {
+        await runFederatedSearch(appState.activeQuery, appState.activeFacet);
+      }
+      showDocumentModal(res.document);
+    } catch (err) {
+      showToast(err.message);
+    }
+  });
+
   const body = el('div', {}, [
-    el('div', { className: 'doc-meta', style: { marginBottom: '0.75rem' } }, [
+    el('div', { className: 'doc-meta' }, [
       el('span', { className: 'badge badge-blue', text: doc.docCode }),
       el('span', { className: 'badge badge-teal', text: doc.sourceSystem }),
-      el('span', { text: `Mis à jour : ${doc.updatedAt || 'Récent'}` }),
+      el('span', { text: `Owner : @${doc.ownerLdap} • Mis à jour : ${doc.updatedAt || 'Récent'}` }),
     ]),
-    el('p', {
+    freshnessBanner,
+    el('div', {
+      className: 'doc-reader-body',
       text: doc.content || doc.summary,
-      style: { marginBottom: '1rem', color: '#0f172a' },
     }),
-    doc.goLink
-      ? el('button', {
-          className: 'btn-primary btn-sm',
-          text: `Ouvrir le raccourci associé (${doc.goLink})`,
-          attrs: { type: 'button' },
-          onClick: () => {
-            closeModal();
-            triggerGoLinkResolution(doc.goLink);
-          },
-        })
-      : null,
+    el('div', { className: 'doc-actions-row' }, [
+      doc.goLink
+        ? el('button', {
+            className: 'btn-primary btn-sm',
+            text: `Ouvrir le raccourci associé (${doc.goLink})`,
+            attrs: { type: 'button' },
+            onClick: () => {
+              closeModal();
+              triggerGoLinkResolution(doc.goLink);
+            },
+          })
+        : null,
+    ]),
+    flagForm,
   ]);
-  openModal(doc.title, body);
+  openModal(`${doc.docCode} — ${doc.title}`, body);
 }
 
 async function triggerGoLinkResolution(slug) {
@@ -1272,14 +1548,24 @@ async function loadPersonOrgChart(ldap, revealPii = false) {
             }),
           ]),
         ]),
-        p.piiMasked
-          ? el('button', {
-              className: 'btn-secondary btn-sm',
-              text: 'Révéler Contact (PII protégée)',
-              attrs: { type: 'button' },
-              onClick: () => loadPersonOrgChart(p.ldap, true),
-            })
-          : el('span', { className: 'badge badge-green', text: 'Coordonnées démasquées' }),
+        el('div', { className: 'doc-actions-row' }, [
+          !appState.currentUser || appState.currentUser.ldap !== p.ldap
+            ? el('button', {
+                className: 'btn-primary btn-sm',
+                text: `★ Envoyer un Kudos à @${p.ldap}`,
+                attrs: { type: 'button' },
+                onClick: () => openSendKudosModal(p.ldap),
+              })
+            : null,
+          p.piiMasked
+            ? el('button', {
+                className: 'btn-secondary btn-sm',
+                text: 'Révéler Contact (PII protégée)',
+                attrs: { type: 'button' },
+                onClick: () => loadPersonOrgChart(p.ldap, true),
+              })
+            : el('span', { className: 'badge badge-green', text: 'Coordonnées démasquées' }),
+        ]),
       ])
     );
 
@@ -1324,14 +1610,36 @@ async function loadPersonOrgChart(ldap, revealPii = false) {
     detailContainer.appendChild(skillsRow);
 
     detailContainer.appendChild(
-      el('div', { className: 'info-label', text: 'Groupes IAM & Mailing-Lists (Moma Groups)', style: { marginTop: '0.85rem' } })
+      el('div', { className: 'info-label section-label-spaced', text: 'Groupes IAM & Mailing-Lists (Moma Groups)' })
     );
     detailContainer.appendChild(groupsRow);
 
     detailContainer.appendChild(
-      el('div', { className: 'info-label', text: 'Projets & OKRs Actifs', style: { marginTop: '0.85rem' } })
+      el('div', { className: 'info-label section-label-spaced', text: 'Projets & OKRs Actifs' })
     );
     detailContainer.appendChild(projectsList);
+
+    if ((data.kudosReceived || []).length > 0) {
+      detailContainer.appendChild(
+        el('div', {
+          className: 'info-label section-label-spaced',
+          text: `Peer Kudos & Reconnaissance reçus (${data.kudosReceived.length})`,
+        })
+      );
+      const kudosBox = el('div', { className: 'kudos-list' });
+      for (const k of data.kudosReceived) {
+        kudosBox.appendChild(
+          el('div', { className: 'kudos-item' }, [
+            el('div', { className: 'kudos-header' }, [
+              el('span', { className: 'badge badge-amber', text: `★ ${k.badgeType} (+${k.points})` }),
+              el('span', { className: 'golink-mini-meta', text: `De @${k.fromLdap}` }),
+            ]),
+            el('div', { className: 'kudos-message', text: k.message }),
+          ])
+        );
+      }
+      detailContainer.appendChild(kudosBox);
+    }
   }
 
   // Render Interactive Org Chart Tree
@@ -1463,6 +1771,7 @@ async function loadGoLinksRegistry() {
   const catSelect = document.getElementById('goCategoryFilter');
   const category = catSelect ? catSelect.value : '';
   const data = await apiFetch(`/api/golinks?category=${encodeURIComponent(category)}`);
+  const pinnedSet = new Set(data.pinnedSlugs || appState.pinnedSlugs || []);
 
   const wrapper = document.getElementById('goLinksTableContainer');
   if (!wrapper) return;
@@ -1485,6 +1794,7 @@ async function loadGoLinksRegistry() {
     const canDelete =
       appState.currentUser &&
       (appState.currentUser.ldap === g.owner_ldap || appState.currentUser.role === 'admin');
+    const isPinned = Boolean(g.isPinned || pinnedSet.has(g.slug));
 
     const tr = el('tr', {}, [
       el('td', {}, [
@@ -1517,7 +1827,13 @@ async function loadGoLinksRegistry() {
       ]),
       el('td', { text: String(g.hits), style: { fontWeight: '700' } }),
       el('td', {}, [
-        el('div', { style: { display: 'flex', gap: '0.4rem' } }, [
+        el('div', { className: 'doc-actions-row' }, [
+          el('button', {
+            className: isPinned ? 'pin-btn pinned' : 'pin-btn',
+            text: isPinned ? '★ Épinglé' : '☆ Épingler',
+            attrs: { type: 'button' },
+            onClick: () => handleTogglePin(g.slug),
+          }),
           el('button', {
             className: 'btn-secondary btn-sm',
             text: 'Ouvrir',
@@ -1564,34 +1880,34 @@ function renderBlueprintView() {
 
   const pillars = [
     {
-      badge: 'Pilier 1 • Indexation Fédérée & Schéma Universel',
-      title: 'Connecteurs Pluggables (SharePoint, Jira, ServiceNow, SAP, Workday, Custom API)',
-      desc: 'Chez Google, Moma s’appuie sur un index unifié où chaque outil interne pousse ses données (ItemContent + ItemMetadata + ACLs). Pour un client externe, ce SDK de connecteurs permet d’ingérer ses propres outils (Microsoft 365, Atlassian, SAP, Salesforce ou API métier) sans dépendre des outils internes Google.',
+      badge: 'Pilier 1 • Recherche Hybride BM25 + Vecteurs (RRF)',
+      title: 'Fusion FTS5 BM25 + Embeddings Gemini 2 (Reciprocal Rank Fusion)',
+      desc: 'Les documents multi-connecteurs sont indexés simultanément dans SQLite FTS5 (BM25 lexical) et sous forme de vecteurs sémantiques (gemini-embedding-2 ou espace vectoriel multilingue local 256-D), fusionnés par Reciprocal Rank Fusion (RRF) après filtrage ACL.',
     },
     {
-      badge: 'Pilier 2 • Architecture Moma OneBox (Temps Réel)',
-      title: 'Fédération Temps Réel & Cartes Structurées « OneBox »',
-      desc: 'Lorsqu’un collaborateur tape une requête métier (ex: numéro de commande SAP, solde de congés Workday, astreinte On-Call, ou un mot-clé d’outil custom), le routeur OneBox interroge en parallèle l’API de l’outil cible et affiche une carte structurée au-dessus des résultats en < 150 ms.',
+      badge: 'Pilier 2 • Architecture Moma OneBox & Webhooks Anti-SSRF',
+      title: 'Fédération Sortante Temps Réel & Actions Signées HMAC-SHA256',
+      desc: 'Le routeur OneBox interroge en direct les endpoints REST des outils clients (protégé contre le SSRF avec blocage RFC1918/metadata 169.254.169.254 et circuit-breaker 1.5s) et notifie les approbations via webhooks signés X-WhatsMomat-Signature.',
     },
     {
       badge: 'Pilier 3 • Contrôle d’Accès (Query-Time ACL Trimming)',
       title: 'Propagation d’Identité & Sécurité Zero-Trust avant l’IA',
-      desc: 'Chaque document ou carte OneBox porte sa liste de contrôle d’accès (ACL) synchronisée depuis Entra ID / Okta / LDAP. Le filtrage s’exécute AVANT l’envoi du contexte au LLM : Gemini ne voit jamais un document auquel l’employé n’a pas accès.',
+      desc: 'Chaque document, lecteur intégral ou carte OneBox porte sa liste de contrôle d’accès (ACL) synchronisée depuis Entra ID / Okta / LDAP. Le filtrage s’exécute AVANT l’envoi du contexte au LLM Gemini.',
     },
     {
-      badge: 'Pilier 4 • Synthèse IA Générative',
+      badge: 'Pilier 4 • Synthèse IA Générative & Ask Moma Multi-Tour',
       title: 'Moma AI Overview propulsé par Gemini 3.8 Flash (@google/genai)',
-      desc: 'Utilisation de l’API Interactions (client.interactions.create avec gemini-3.8-flash) ancrée exclusivement sur les extraits autorisés issus de tous les connecteurs actifs, avec citations numérotées [1], [2] et recommandation d’experts internes.',
+      desc: 'Utilisation de l’API Interactions (client.interactions.create avec gemini-3.8-flash et previous_interaction_id) ancrée exclusivement sur les extraits autorisés issus des connecteurs actifs, avec citations vérifiables [1], [2].',
     },
     {
-      badge: 'Pilier 5 • Mécanisme go/links',
-      title: 'Domaine DNS Interne "go" + Création Automatique par Outil',
-      desc: 'Déploiement d’une entrée DHCP/DNS Search Domain (go.corp.internal). Chaque nouvel outil branché dans le Studio de Connecteurs reçoit automatiquement son raccourci go/<outil> en plus des liens créés par les équipes.',
+      badge: 'Pilier 5 • Barre d’Adresse Navigateur (OpenSearch & Extension MV3)',
+      title: 'Omnibox Native "moma <Tab>" + Redirection http://go/<alias>',
+      desc: 'Exposition native de /opensearch.xml (autocomplétion /api/opensearch-suggest) et extension Chrome/Edge Manifest V3 (browser-extension/) interceptant http://go/<alias> vers /go/<alias> sans modification DNS poste.',
     },
     {
-      badge: 'Pilier 6 • Annuaire & Graphe Teams (Who’s Who)',
-      title: 'Synchronisation SIRH (Workday / Entra ID) & Masquage PII',
-      desc: 'Reconstitution temps réel de la chaîne de management (N+1, pairs, N-1), des badges culturels, des fuseaux horaires et des raccourcis go/ maintenus par chaque collaborateur, avec masquage PII par défaut.',
+      badge: 'Pilier 6 • Provisioning SCIM 2.0, Culture Peer Kudos & Fraîcheur',
+      title: 'Sync Identités SCIM 2.0 + Révocation Sessions, go/kudos & g3doc Freshness',
+      desc: 'Endpoint SCIM 2.0 (/api/v1/scim/v2/Users) révoquant instantanément toutes les sessions SQLite actives à la désactivation d’un compte, reconnaissance entre pairs (go/kudos) et signalement d’obsolescence documentaire.',
     },
   ];
 
@@ -1923,8 +2239,19 @@ async function bootstrapMomaApp() {
 
     const params = new URLSearchParams(window.location.search);
     const goResolved = params.get('goResolved');
+    const initialQuery = params.get('q');
     if (goResolved) {
-      triggerGoLinkResolution(goResolved);
+      if (goResolved === 'kudos') {
+        openSendKudosModal('');
+      } else {
+        triggerGoLinkResolution(goResolved);
+      }
+      window.history.replaceState({}, '', '/');
+    } else if (initialQuery && initialQuery.trim()) {
+      const sInput = document.getElementById('globalSearchInput');
+      if (sInput) sInput.value = initialQuery.trim();
+      updateOmniboxBadge(initialQuery.trim());
+      await runFederatedSearch(initialQuery.trim(), 'all');
       window.history.replaceState({}, '', '/');
     }
   } catch (err) {
@@ -1987,6 +2314,11 @@ async function bootstrapMomaApp() {
   const openCreateTicketBtn = document.getElementById('openCreateTicketBtn');
   if (openCreateTicketBtn) {
     openCreateTicketBtn.addEventListener('click', () => openQuickTicketModal(''));
+  }
+
+  const openSendKudosBtn = document.getElementById('openSendKudosBtn');
+  if (openSendKudosBtn) {
+    openSendKudosBtn.addEventListener('click', () => openSendKudosModal(''));
   }
 
   const searchCreateTicketBtn = document.getElementById('searchCreateTicketBtn');
@@ -2070,6 +2402,8 @@ async function bootstrapMomaApp() {
   if (createConnectorForm) {
     createConnectorForm.addEventListener('submit', async (e) => {
       e.preventDefault();
+      const liveUrlEl = document.getElementById('connLiveUrlInput');
+      const webhookUrlEl = document.getElementById('connApprovalWebhookInput');
       const payload = {
         name: document.getElementById('connNameInput').value,
         connectorKey: document.getElementById('connKeyInput').value,
@@ -2080,6 +2414,8 @@ async function bootstrapMomaApp() {
         visibilityDept: document.getElementById('connDeptInput').value,
         oneboxMetricLabel: document.getElementById('connMetricLabelInput').value,
         oneboxMetricValue: document.getElementById('connMetricValueInput').value,
+        liveEndpointUrl: liveUrlEl ? liveUrlEl.value.trim() : '',
+        approvalWebhookUrl: webhookUrlEl ? webhookUrlEl.value.trim() : '',
         sampleTitle: document.getElementById('connSampleTitleInput').value,
         sampleContent: document.getElementById('connSampleContentInput').value,
       };

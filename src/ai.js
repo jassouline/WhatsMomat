@@ -1,10 +1,10 @@
 /**
  * WhatsMomat AI Overview & Multi-Turn Enterprise RAG Synthesis Engine
- * Uses @google/genai (Interactions API) with `gemini-3.7-flash` (or GEMINI_MODEL) when GEMINI_API_KEY is set,
+ * Uses @google/genai (Interactions API) with `gemini-3.8-flash` (or GEMINI_MODEL) when GEMINI_API_KEY is set,
  * and provides a deterministic grounded RAG synthesis fallback when running offline.
  */
 
-const DEFAULT_GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-3.7-flash';
+const DEFAULT_GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-3.8-flash';
 
 export async function generateMomaAiOverview(query, searchResults, currentUser) {
   const cleanQuery = String(query || '').trim();

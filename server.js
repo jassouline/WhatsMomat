@@ -6,12 +6,28 @@ import { fileURLToPath } from 'node:url';
 import {
   ACTIVE_DB_PATH,
   initDatabase,
+  createDbSession,
+  getValidDbSession,
+  updateDbSessionUser,
+  deleteDbSession,
+  deleteAllUserDbSessions,
   getUserByLdap,
   getUserByIdentity,
   listAllUsers,
   getOrgChartForUser,
+  listScimUsers,
+  provisionScimUser,
+  listKudos,
+  sendPeerKudo,
+  listUserPinnedSlugs,
+  toggleUserPin,
+  getDocumentByCode,
+  flagDocumentOutdated,
+  getConnectorRaw,
+  listConnectorsRawEnabled,
   listConnectors,
   toggleConnectorState,
+  configureConnectorOutboundUrls,
   registerCustomToolConnector,
   ingestExternalData,
   listGoLinks,
@@ -29,6 +45,8 @@ import {
   listAuditLogs,
 } from './src/db.js';
 import { generateMomaAiOverview, askMomaFollowUp } from './src/ai.js';
+import { generateTextEmbedding } from './src/embeddings.js';
+import { fetchLiveOutboundOneBoxes, dispatchApprovalActionWebhook } from './src/outbound.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -64,13 +82,10 @@ const SESSION_SECRET = resolveSessionSecret();
 const SESSION_TTL_MS = 30 * 60 * 1000; // 30 minutes finite session lifetime
 const COOKIE_NAME = '__Secure-moma_sid';
 
-// Server-side in-memory session store
-const sessionStore = new Map();
-
 // Rate limiter store
 const rateLimitStore = new Map();
 const RATE_LIMIT_WINDOW_MS = 60 * 1000;
-const RATE_LIMIT_MAX_REQUESTS = 240;
+const RATE_LIMIT_MAX_REQUESTS = 320;
 
 function signSessionId(rawId) {
   const mac = crypto.createHmac('sha256', SESSION_SECRET).update(rawId).digest('hex');
@@ -90,29 +105,6 @@ function verifySignedSessionId(signedCookie) {
     return null;
   }
   return rawId;
-}
-
-function createSession(userLdap = 'jassouline') {
-  const rawId = crypto.randomBytes(32).toString('hex');
-  const csrfToken = crypto.randomBytes(24).toString('hex');
-  const now = Date.now();
-  const session = {
-    id: rawId,
-    userLdap,
-    csrfToken,
-    createdAt: now,
-    expiresAt: now + SESSION_TTL_MS,
-  };
-  sessionStore.set(rawId, session);
-  return session;
-}
-
-function invalidateUserSessions(userLdap) {
-  for (const [sid, sess] of sessionStore.entries()) {
-    if (sess.userLdap === userLdap) {
-      sessionStore.delete(sid);
-    }
-  }
 }
 
 function parseCookies(cookieHeader) {
@@ -149,23 +141,39 @@ function formatSessionCookie(signedValue, maxAgeSeconds = 1800) {
   return flags.join('; ');
 }
 
-function getOrCreateSession(req, res, defaultLdap = 'jassouline') {
+/**
+ * Resolves a persistent SQLite session.
+ * If a valid signed cookie was presented whose session has been revoked (e.g. logout or SCIM deactivation),
+ * returns `{ session: null, revoked: true }` so API routes fail closed with 401.
+ */
+function resolveOrCreateSession(req, res, defaultLdap = 'jassouline', allowBootstrapIfRevoked = false) {
   const cookies = parseCookies(req.headers.cookie);
   const signedSid = cookies[COOKIE_NAME];
   if (signedSid) {
     const rawId = verifySignedSessionId(signedSid);
-    if (rawId && sessionStore.has(rawId)) {
-      const sess = sessionStore.get(rawId);
-      if (sess.expiresAt > Date.now()) {
-        sess.expiresAt = Date.now() + SESSION_TTL_MS;
-        return sess;
+    if (rawId) {
+      const existing = getValidDbSession(rawId, SESSION_TTL_MS);
+      if (existing) {
+        return { session: existing, revoked: false };
       }
-      sessionStore.delete(rawId);
+      if (!allowBootstrapIfRevoked) {
+        res.setHeader('Set-Cookie', formatSessionCookie('', 0));
+        return { session: null, revoked: true };
+      }
     }
   }
-  const newSession = createSession(defaultLdap);
+  const newSession = createDbSession(defaultLdap, SESSION_TTL_MS);
   res.setHeader('Set-Cookie', formatSessionCookie(signSessionId(newSession.id), 1800));
-  return newSession;
+  return { session: newSession, revoked: false };
+}
+
+function getExistingSessionFromRequest(req) {
+  const cookies = parseCookies(req.headers.cookie);
+  const signedSid = cookies[COOKIE_NAME];
+  if (!signedSid) return null;
+  const rawId = verifySignedSessionId(signedSid);
+  if (!rawId) return null;
+  return getValidDbSession(rawId, SESSION_TTL_MS);
 }
 
 function validateCsrfToken(req, session) {
@@ -180,12 +188,12 @@ function validateCsrfToken(req, session) {
 }
 
 /**
- * Constant-time verification of Machine-to-Machine Bearer token for /api/v1/ingest.
- * Fails closed when INGEST_API_TOKEN is not configured in environment.
+ * Constant-time verification of Machine-to-Machine Bearer tokens (Ingest & SCIM 2.0).
+ * Fails closed when token is unconfigured or shorter than 24 characters.
  */
-function verifyIngestBearerToken(req) {
-  const configuredToken = String(process.env.INGEST_API_TOKEN || '').trim();
-  if (configuredToken.length < 24) {
+function verifyBearerSecret(req, configuredSecret) {
+  const cleanSecret = String(configuredSecret || '').trim();
+  if (cleanSecret.length < 24) {
     return false;
   }
   const authHeader = String(req.headers.authorization || '').trim();
@@ -197,8 +205,16 @@ function verifyIngestBearerToken(req) {
     return false;
   }
   const digestA = crypto.createHash('sha256').update(providedToken, 'utf-8').digest();
-  const digestB = crypto.createHash('sha256').update(configuredToken, 'utf-8').digest();
+  const digestB = crypto.createHash('sha256').update(cleanSecret, 'utf-8').digest();
   return crypto.timingSafeEqual(digestA, digestB);
+}
+
+function verifyIngestBearerToken(req) {
+  return verifyBearerSecret(req, process.env.INGEST_API_TOKEN);
+}
+
+function verifyScimBearerToken(req) {
+  return verifyBearerSecret(req, process.env.SCIM_API_TOKEN || process.env.INGEST_API_TOKEN);
 }
 
 function checkRateLimit(req) {
@@ -232,6 +248,15 @@ function resolveAllowedOrigin(reqOrigin, port) {
   return `http://127.0.0.1:${port}`;
 }
 
+function escapeXml(str) {
+  return String(str || '')
+    .replaceAll('&', '&amp;')
+    .replaceAll('<', '&lt;')
+    .replaceAll('>', '&gt;')
+    .replaceAll('"', '&quot;')
+    .replaceAll("'", '&apos;');
+}
+
 function applySecurityHeaders(req, res, nonce, port) {
   const csp = [
     "default-src 'self'",
@@ -258,10 +283,10 @@ function applySecurityHeaders(req, res, nonce, port) {
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type, X-CSRF-Token, Authorization');
 }
 
-function sendJson(res, statusCode, payload) {
+function sendJson(res, statusCode, payload, contentType = 'application/json; charset=utf-8') {
   const body = JSON.stringify(payload);
   res.statusCode = statusCode;
-  res.setHeader('Content-Type', 'application/json; charset=utf-8');
+  res.setHeader('Content-Type', contentType);
   res.end(body);
 }
 
@@ -367,10 +392,29 @@ export const server = http.createServer(async (req, res) => {
   if (req.method === 'GET' && pathname === '/api/healthz') {
     sendJson(res, 200, {
       status: 'ok',
-      version: '1.1.0',
+      version: '1.2.0',
       authMode,
       dbMode: ACTIVE_DB_PATH === ':memory:' ? 'memory' : 'sqlite-wal',
     });
+    return;
+  }
+
+  // OpenSearch Browser Descriptor (/opensearch.xml) — enables Chrome/Edge/Firefox Tab-to-Search ("moma <Tab>")
+  if (req.method === 'GET' && pathname === '/opensearch.xml') {
+    const safeOrigin = resolveAllowedOrigin(req.headers.origin, activePort);
+    const xml = [
+      '<?xml version="1.0" encoding="UTF-8"?>',
+      '<OpenSearchDescription xmlns="http://a9.com/-/spec/opensearch/1.1/">',
+      '  <ShortName>WhatsMomat</ShortName>',
+      '  <Description>Recherche fédérée intranet WhatsMomat (Moma, OneBox, Teams, go/links, Whatis)</Description>',
+      '  <InputEncoding>UTF-8</InputEncoding>',
+      `  <Url type="text/html" method="get" template="${escapeXml(safeOrigin)}/?q={searchTerms}" />`,
+      `  <Url type="application/x-suggestions+json" method="get" template="${escapeXml(safeOrigin)}/api/opensearch-suggest?q={searchTerms}" />`,
+      '</OpenSearchDescription>',
+    ].join('\n');
+    res.statusCode = 200;
+    res.setHeader('Content-Type', 'application/opensearchdescription+xml; charset=utf-8');
+    res.end(xml);
     return;
   }
 
@@ -380,8 +424,8 @@ export const server = http.createServer(async (req, res) => {
     let ingestActorLdap = 'api-connector';
 
     if (!isBearerAuth) {
-      const session = getOrCreateSession(req, res);
-      if (!validateCsrfToken(req, session)) {
+      const session = getExistingSessionFromRequest(req);
+      if (!session || !validateCsrfToken(req, session)) {
         sendJson(res, 403, { error: 'Authentification Bearer INGEST_API_TOKEN ou jeton CSRF valide requis.' });
         return;
       }
@@ -403,12 +447,70 @@ export const server = http.createServer(async (req, res) => {
     return;
   }
 
+  // SCIM 2.0 Directory Provisioning & Deactivation API (/api/v1/scim/v2/Users)
+  if (pathname === '/api/v1/scim/v2/Users') {
+    const isScimBearer = verifyScimBearerToken(req);
+    let scimActorLdap = 'scim-idp';
+
+    if (!isScimBearer) {
+      const session = getExistingSessionFromRequest(req);
+      if (!session) {
+        sendJson(
+          res,
+          401,
+          {
+            schemas: ['urn:ietf:params:scim:api:messages:2.0:Error'],
+            detail: 'Authentification Bearer SCIM_API_TOKEN requise.',
+            status: '401',
+          },
+          'application/scim+json; charset=utf-8'
+        );
+        return;
+      }
+      if (req.method === 'POST' && !validateCsrfToken(req, session)) {
+        sendJson(res, 403, { error: 'Jeton Bearer SCIM_API_TOKEN ou CSRF valide requis.' });
+        return;
+      }
+      const sessionUser = getUserByLdap(session.userLdap, true);
+      if (!sessionUser || sessionUser.role !== 'admin') {
+        sendJson(res, 403, { error: 'Accès SCIM 2.0 réservé au fournisseur d’identité (IdP) ou à un administrateur.' });
+        return;
+      }
+      scimActorLdap = sessionUser.ldap;
+    }
+
+    if (req.method === 'GET') {
+      sendJson(res, 200, listScimUsers(), 'application/scim+json; charset=utf-8');
+      return;
+    }
+    if (req.method === 'POST') {
+      try {
+        const body = await readJsonBody(req, 65536);
+        const { created, resource } = provisionScimUser(body, scimActorLdap, clientIp);
+        sendJson(res, created ? 201 : 200, resource, 'application/scim+json; charset=utf-8');
+      } catch (err) {
+        sendJson(
+          res,
+          400,
+          {
+            schemas: ['urn:ietf:params:scim:api:messages:2.0:Error'],
+            detail: err.message || 'Requête SCIM 2.0 invalide.',
+            status: '400',
+          },
+          'application/scim+json; charset=utf-8'
+        );
+      }
+      return;
+    }
+  }
+
   // Resolve enterprise user identity:
   // - In production IAP mode (`AUTH_MODE=iap`), read verified proxy identity header and fail closed if missing/unknown.
-  // - In demo mode (`AUTH_MODE=demo`), use signed HttpOnly session persona.
+  // - In demo mode (`AUTH_MODE=demo`), use signed HttpOnly SQLite-persisted session persona.
   // TODO(security): Verify cryptographic JWT signature (`x-goog-iap-jwt-assertion`) against Google IAP public keys in production.
   let currentUser = null;
   let session = null;
+  const allowSessionBootstrap = pathname === '/api/session' || !pathname.startsWith('/api/');
 
   if (authMode === 'iap') {
     const iapIdentity =
@@ -420,12 +522,19 @@ export const server = http.createServer(async (req, res) => {
       });
       return;
     }
-    session = getOrCreateSession(req, res, currentUser?.ldap || 'jassouline');
-    if (currentUser) {
+    const resolvedSess = resolveOrCreateSession(req, res, currentUser?.ldap || 'jassouline', true);
+    session = resolvedSess.session;
+    if (currentUser && session && session.userLdap !== currentUser.ldap) {
+      updateDbSessionUser(session.id, currentUser.ldap);
       session.userLdap = currentUser.ldap;
     }
   } else {
-    session = getOrCreateSession(req, res);
+    const resolvedSess = resolveOrCreateSession(req, res, 'jassouline', allowSessionBootstrap);
+    if (resolvedSess.revoked && pathname.startsWith('/api/')) {
+      sendJson(res, 401, { error: 'Session expirée ou révoquée (déconnexion ou désactivation SCIM).' });
+      return;
+    }
+    session = resolvedSess.session;
     currentUser = getUserByLdap(session.userLdap, true) || getUserByLdap('jassouline', true);
   }
 
@@ -515,9 +624,10 @@ export const server = http.createServer(async (req, res) => {
       const targetLdap = String(body.ldap || '').trim().toLowerCase();
       const targetUser = getUserByLdap(targetLdap, true);
       if (!targetUser) {
-        sendJson(res, 404, { error: 'Profil collaborateur introuvable.' });
+        sendJson(res, 404, { error: 'Profil collaborateur introuvable ou compte désactivé.' });
         return;
       }
+      updateDbSessionUser(session.id, targetUser.ldap);
       session.userLdap = targetUser.ldap;
       sendJson(res, 200, {
         message: `Session basculée sur @${targetUser.ldap} (${targetUser.department} / ${targetUser.role})`,
@@ -527,8 +637,8 @@ export const server = http.createServer(async (req, res) => {
     }
 
     if (req.method === 'POST' && pathname === '/api/auth/logout') {
-      sessionStore.delete(session.id);
-      invalidateUserSessions(session.userLdap);
+      deleteDbSession(session.id);
+      deleteAllUserDbSessions(session.userLdap);
       res.setHeader('Set-Cookie', formatSessionCookie('', 0));
       sendJson(res, 200, { loggedOut: true });
       return;
@@ -544,11 +654,20 @@ export const server = http.createServer(async (req, res) => {
       return;
     }
 
-    // 4. Unified Federated Search + OneBox + AI Overview API
+    // 4. Unified Hybrid Federated Search (BM25 + Vector RRF) + Live Outbound OneBox + AI Overview API
     if (req.method === 'GET' && pathname === '/api/search') {
       const q = parsedUrl.searchParams.get('q') || '';
       const facet = parsedUrl.searchParams.get('facet') || 'all';
-      const results = executeFederatedSearch(q, currentUser, facet);
+      const queryEmbeddingObj =
+        process.env.GEMINI_API_KEY && q.trim().length >= 2 ? await generateTextEmbedding(q) : null;
+      const results = executeFederatedSearch(q, currentUser, facet, queryEmbeddingObj);
+
+      // Query SSRF-hardened live outbound OneBox endpoints in parallel with 1.5s circuit breaker
+      const liveCards = await fetchLiveOutboundOneBoxes(q, currentUser, listConnectorsRawEnabled());
+      if (liveCards.length > 0) {
+        results.oneBoxCards = [...liveCards, ...results.oneBoxCards];
+      }
+
       const aiOverview = await generateMomaAiOverview(q, results, currentUser);
       sendJson(res, 200, {
         ...results,
@@ -557,7 +676,23 @@ export const server = http.createServer(async (req, res) => {
       return;
     }
 
-    // 5. People Directory & Interactive Org Chart (Moma Teams) API
+    // OpenSearch Address-Bar Autocomplete Suggestions API
+    if (req.method === 'GET' && pathname === '/api/opensearch-suggest') {
+      const q = parsedUrl.searchParams.get('q') || '';
+      const safeOrigin = resolveAllowedOrigin(req.headers.origin, activePort);
+      const { suggestions } = getOmniboxTypeahead(q, currentUser);
+      const completions = suggestions.map((s) => s.queryValue || s.label || '');
+      const descriptions = suggestions.map((s) => `${s.badge || s.kind} — ${s.sublabel || s.label || ''}`);
+      const urls = suggestions.map((s) =>
+        s.kind === 'golink'
+          ? `${safeOrigin}/go/${encodeURIComponent(String(s.queryValue || '').replace(/^go\//, ''))}`
+          : `${safeOrigin}/?q=${encodeURIComponent(s.queryValue || '')}`
+      );
+      sendJson(res, 200, [q, completions, descriptions, urls], 'application/x-suggestions+json; charset=utf-8');
+      return;
+    }
+
+    // 5. People Directory, Org Chart & Peer Kudos (Moma Teams) API
     if (req.method === 'GET' && pathname === '/api/people') {
       const q = parsedUrl.searchParams.get('q') || '';
       const dept = parsedUrl.searchParams.get('department') || '';
@@ -588,7 +723,48 @@ export const server = http.createServer(async (req, res) => {
       return;
     }
 
-    // 6. Enterprise Connectors & Custom Client Tool Integration API
+    if (req.method === 'GET' && pathname === '/api/kudos') {
+      const targetLdap = parsedUrl.searchParams.get('ldap') || '';
+      const limit = parsedUrl.searchParams.get('limit') || '15';
+      sendJson(res, 200, { kudos: listKudos(targetLdap, limit) });
+      return;
+    }
+
+    if (req.method === 'POST' && pathname === '/api/kudos') {
+      const body = await readJsonBody(req);
+      try {
+        const kudo = sendPeerKudo(body, currentUser);
+        sendJson(res, 201, { kudo });
+      } catch (err) {
+        sendJson(res, 400, { error: err.message || 'Impossible d’envoyer ce Peer Kudo.' });
+      }
+      return;
+    }
+
+    // 6. Full Document Reader & Freshness Flagging (ACL-enforced)
+    if (req.method === 'GET' && pathname.startsWith('/api/documents/')) {
+      const docCode = decodeURIComponent(pathname.slice('/api/documents/'.length));
+      try {
+        const doc = getDocumentByCode(docCode, currentUser);
+        sendJson(res, 200, { document: doc });
+      } catch (err) {
+        sendJson(res, err.statusCode || 400, { error: err.message || 'Accès au document refusé.' });
+      }
+      return;
+    }
+
+    if (req.method === 'POST' && pathname === '/api/documents/flag-outdated') {
+      const body = await readJsonBody(req);
+      try {
+        const updatedDoc = flagDocumentOutdated(body, currentUser);
+        sendJson(res, 200, { document: updatedDoc });
+      } catch (err) {
+        sendJson(res, err.statusCode || 400, { error: err.message || 'Impossible de mettre à jour le statut du document.' });
+      }
+      return;
+    }
+
+    // 7. Enterprise Connectors, Outbound Federation & Custom Client Tool Integration API
     if (req.method === 'GET' && pathname === '/api/connectors') {
       sendJson(res, 200, { connectors: listConnectors() });
       return;
@@ -605,6 +781,17 @@ export const server = http.createServer(async (req, res) => {
       return;
     }
 
+    if (req.method === 'POST' && pathname === '/api/connectors/endpoints') {
+      const body = await readJsonBody(req);
+      try {
+        const updated = configureConnectorOutboundUrls(body, currentUser);
+        sendJson(res, 200, { connector: updated });
+      } catch (err) {
+        sendJson(res, err.statusCode || 400, { error: err.message || 'URL sortante refusée.' });
+      }
+      return;
+    }
+
     if (req.method === 'POST' && pathname === '/api/connectors/custom') {
       const body = await readJsonBody(req);
       try {
@@ -616,12 +803,28 @@ export const server = http.createServer(async (req, res) => {
       return;
     }
 
-    // 7. go/links Registry & Creation API
+    // 8. go/links Registry, Creation & User Pins API
     if (req.method === 'GET' && pathname === '/api/golinks') {
       const q = parsedUrl.searchParams.get('q') || '';
       const category = parsedUrl.searchParams.get('category') || '';
-      const links = listGoLinks(q, category);
-      sendJson(res, 200, { goLinks: links });
+      const pinnedSlugs = listUserPinnedSlugs(currentUser?.ldap);
+      const pinnedSet = new Set(pinnedSlugs);
+      const links = listGoLinks(q, category).map((g) => ({
+        ...g,
+        isPinned: pinnedSet.has(g.slug),
+      }));
+      sendJson(res, 200, { goLinks: links, pinnedSlugs });
+      return;
+    }
+
+    if (req.method === 'POST' && pathname === '/api/pins/toggle') {
+      const body = await readJsonBody(req);
+      try {
+        const pinResult = toggleUserPin(body.slug, currentUser);
+        sendJson(res, 200, pinResult);
+      } catch (err) {
+        sendJson(res, 400, { error: err.message || 'Impossible d’épingler ce raccourci.' });
+      }
       return;
     }
 
@@ -658,7 +861,7 @@ export const server = http.createServer(async (req, res) => {
       return;
     }
 
-    // 8. Predictive Instant Omnibox Typeahead API
+    // 9. Predictive Instant Omnibox Typeahead API
     if (req.method === 'GET' && pathname === '/api/typeahead') {
       const q = parsedUrl.searchParams.get('q') || '';
       const payload = getOmniboxTypeahead(q, currentUser);
@@ -666,7 +869,7 @@ export const server = http.createServer(async (req, res) => {
       return;
     }
 
-    // 9. Whatis Acronym Decoder & Collaborative Glossary API
+    // 10. Whatis Acronym Decoder & Collaborative Glossary API
     if (req.method === 'GET' && pathname === '/api/whatis') {
       const q = parsedUrl.searchParams.get('q') || '';
       const category = parsedUrl.searchParams.get('category') || '';
@@ -686,12 +889,30 @@ export const server = http.createServer(async (req, res) => {
       return;
     }
 
-    // 10. Actionable Approvals Center & Direct Ticket Creation API
+    // 11. Actionable Approvals Center (+ Signed Outbound Webhook) & Direct Ticket Creation API
     if (req.method === 'POST' && pathname === '/api/approvals/act') {
       const body = await readJsonBody(req);
       try {
         const updated = actOnApproval(body.approvalKey, body.decision, currentUser);
-        sendJson(res, 200, { approval: updated });
+        const connector = getConnectorRaw(updated.connector_key);
+        let webhookDelivery = { configured: false, delivered: false };
+        if (connector?.approval_webhook_url) {
+          webhookDelivery = await dispatchApprovalActionWebhook(
+            connector.approval_webhook_url,
+            updated,
+            currentUser,
+            SESSION_SECRET
+          );
+          recordAuditLog({
+            actorLdap: currentUser.ldap,
+            action: 'APPROVAL_WEBHOOK_DISPATCH',
+            targetType: 'approval',
+            targetKey: updated.approval_key,
+            metadata: webhookDelivery,
+            clientIp,
+          });
+        }
+        sendJson(res, 200, { approval: updated, webhookDelivery });
       } catch (err) {
         sendJson(res, err.statusCode || 400, { error: err.message || 'Action impossible sur cette demande.' });
       }
@@ -709,7 +930,7 @@ export const server = http.createServer(async (req, res) => {
       return;
     }
 
-    // 11. Multi-Turn Conversational "Ask Moma" Follow-Up API
+    // 12. Multi-Turn Conversational "Ask Moma" Follow-Up API
     if (req.method === 'POST' && pathname === '/api/ai/chat') {
       const body = await readJsonBody(req);
       try {
@@ -729,7 +950,7 @@ export const server = http.createServer(async (req, res) => {
       return;
     }
 
-    // 12. Security Audit Logs API (Admin & SecOps only)
+    // 13. Security Audit Logs API (Admin & SecOps only)
     if (req.method === 'GET' && pathname === '/api/audit-logs') {
       try {
         const limit = parsedUrl.searchParams.get('limit') || '50';
@@ -741,7 +962,7 @@ export const server = http.createServer(async (req, res) => {
       return;
     }
 
-    // 13. Static Frontend Assets
+    // 14. Static Frontend Assets
     if (req.method === 'GET') {
       if (pathname === '/' || pathname === '/index.html') {
         serveStaticFile(res, 'index.html', nonce);
@@ -766,7 +987,7 @@ export const server = http.createServer(async (req, res) => {
 if (process.argv[1] && path.resolve(process.argv[1]) === __filename) {
   server.listen(PORT, HOST, () => {
     console.log(
-      `WhatsMomat v1.1 listening securely on http://${HOST}:${PORT} (DB: ${ACTIVE_DB_PATH === ':memory:' ? ':memory:' : path.basename(ACTIVE_DB_PATH)})`
+      `WhatsMomat v1.2 listening securely on http://${HOST}:${PORT} (DB: ${ACTIVE_DB_PATH === ':memory:' ? ':memory:' : path.basename(ACTIVE_DB_PATH)})`
     );
   });
 }
