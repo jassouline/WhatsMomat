@@ -4,13 +4,16 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import {
+  ACTIVE_DB_PATH,
   initDatabase,
   getUserByLdap,
+  getUserByIdentity,
   listAllUsers,
   getOrgChartForUser,
   listConnectors,
   toggleConnectorState,
   registerCustomToolConnector,
+  ingestExternalData,
   listGoLinks,
   resolveGoLink,
   createOrUpdateGoLink,
@@ -22,6 +25,8 @@ import {
   getOmniboxTypeahead,
   executeFederatedSearch,
   getDashboardWidgets,
+  recordAuditLog,
+  listAuditLogs,
 } from './src/db.js';
 import { generateMomaAiOverview, askMomaFollowUp } from './src/ai.js';
 
@@ -29,7 +34,7 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const PUBLIC_DIR = path.resolve(__dirname, 'public');
 
-// Initialize SQLite database and seed enterprise dataset
+// Initialize SQLite database (persistent WAL file or :memory: in test mode) and seed enterprise dataset
 initDatabase();
 
 /**
@@ -48,6 +53,9 @@ function resolveSessionSecret() {
       return fileSecret;
     }
   }
+  if (process.env.NODE_ENV === 'production') {
+    throw new Error('SESSION_SECRET (>= 32 chars) is mandatory when NODE_ENV=production.');
+  }
   console.warn('[SECURITY WARNING] Generating ephemeral session secret. Instance-isolated!');
   return crypto.randomBytes(32).toString('hex');
 }
@@ -62,7 +70,7 @@ const sessionStore = new Map();
 // Rate limiter store
 const rateLimitStore = new Map();
 const RATE_LIMIT_WINDOW_MS = 60 * 1000;
-const RATE_LIMIT_MAX_REQUESTS = 180;
+const RATE_LIMIT_MAX_REQUESTS = 240;
 
 function signSessionId(rawId) {
   const mac = crypto.createHmac('sha256', SESSION_SECRET).update(rawId).digest('hex');
@@ -116,7 +124,11 @@ function parseCookies(cookieHeader) {
     if (idx > 0) {
       const k = part.slice(0, idx).trim();
       const v = part.slice(idx + 1).trim();
-      cookies[k] = decodeURIComponent(v);
+      try {
+        cookies[k] = decodeURIComponent(v);
+      } catch {
+        cookies[k] = v;
+      }
     }
   }
   return cookies;
@@ -137,7 +149,7 @@ function formatSessionCookie(signedValue, maxAgeSeconds = 1800) {
   return flags.join('; ');
 }
 
-function getOrCreateSession(req, res) {
+function getOrCreateSession(req, res, defaultLdap = 'jassouline') {
   const cookies = parseCookies(req.headers.cookie);
   const signedSid = cookies[COOKIE_NAME];
   if (signedSid) {
@@ -151,7 +163,7 @@ function getOrCreateSession(req, res) {
       sessionStore.delete(rawId);
     }
   }
-  const newSession = createSession('jassouline');
+  const newSession = createSession(defaultLdap);
   res.setHeader('Set-Cookie', formatSessionCookie(signSessionId(newSession.id), 1800));
   return newSession;
 }
@@ -167,6 +179,28 @@ function validateCsrfToken(req, session) {
   return crypto.timingSafeEqual(a, b);
 }
 
+/**
+ * Constant-time verification of Machine-to-Machine Bearer token for /api/v1/ingest.
+ * Fails closed when INGEST_API_TOKEN is not configured in environment.
+ */
+function verifyIngestBearerToken(req) {
+  const configuredToken = String(process.env.INGEST_API_TOKEN || '').trim();
+  if (configuredToken.length < 24) {
+    return false;
+  }
+  const authHeader = String(req.headers.authorization || '').trim();
+  if (!authHeader.toLowerCase().startsWith('bearer ')) {
+    return false;
+  }
+  const providedToken = authHeader.slice(7).trim();
+  if (!providedToken) {
+    return false;
+  }
+  const digestA = crypto.createHash('sha256').update(providedToken, 'utf-8').digest();
+  const digestB = crypto.createHash('sha256').update(configuredToken, 'utf-8').digest();
+  return crypto.timingSafeEqual(digestA, digestB);
+}
+
 function checkRateLimit(req) {
   const clientIp = req.socket.remoteAddress || '127.0.0.1';
   const now = Date.now();
@@ -179,7 +213,26 @@ function checkRateLimit(req) {
   return entry.count <= RATE_LIMIT_MAX_REQUESTS;
 }
 
-function applySecurityHeaders(res, nonce, port) {
+function resolveAllowedOrigin(reqOrigin, port) {
+  const allowList = new Set([
+    `http://127.0.0.1:${port}`,
+    `http://localhost:${port}`,
+  ]);
+  if (process.env.ALLOWED_ORIGINS) {
+    for (const raw of process.env.ALLOWED_ORIGINS.split(',')) {
+      const trimmed = raw.trim();
+      if (trimmed && trimmed !== '*') {
+        allowList.add(trimmed);
+      }
+    }
+  }
+  if (reqOrigin && allowList.has(reqOrigin)) {
+    return reqOrigin;
+  }
+  return `http://127.0.0.1:${port}`;
+}
+
+function applySecurityHeaders(req, res, nonce, port) {
   const csp = [
     "default-src 'self'",
     `script-src 'self' 'nonce-${nonce}'`,
@@ -199,9 +252,10 @@ function applySecurityHeaders(res, nonce, port) {
   res.setHeader('Permissions-Policy', 'camera=(), microphone=(), geolocation=(), payment=()');
   res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
   res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
-  res.setHeader('Access-Control-Allow-Origin', `http://127.0.0.1:${port}`);
+  res.setHeader('Vary', 'Origin');
+  res.setHeader('Access-Control-Allow-Origin', resolveAllowedOrigin(req.headers.origin, port));
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, X-CSRF-Token');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, X-CSRF-Token, Authorization');
 }
 
 function sendJson(res, statusCode, payload) {
@@ -277,11 +331,13 @@ function serveStaticFile(res, requestedFile, nonce) {
 }
 
 const PORT = Number(process.env.PORT) || 3000;
-const HOST = '127.0.0.1'; // Strictly bind to loopback interface (never 0.0.0.0)
+// Defaults strictly to loopback 127.0.0.1 (never 0.0.0.0 unless explicitly overridden inside an isolated container)
+const HOST = process.env.HOST || '127.0.0.1';
 
 export const server = http.createServer(async (req, res) => {
   const nonce = crypto.randomBytes(16).toString('base64');
-  applySecurityHeaders(res, nonce, PORT);
+  const activePort = server.address()?.port || PORT;
+  applySecurityHeaders(req, res, nonce, activePort);
 
   // Strict HTTP method allow-list: only GET and POST are permitted
   if (req.method !== 'GET' && req.method !== 'POST') {
@@ -297,17 +353,83 @@ export const server = http.createServer(async (req, res) => {
 
   let parsedUrl;
   try {
-    parsedUrl = new URL(req.url || '/', `http://${HOST}:${PORT}`);
+    parsedUrl = new URL(req.url || '/', `http://127.0.0.1:${activePort}`);
   } catch {
     sendJson(res, 400, { error: 'Requête invalide.' });
     return;
   }
 
   const pathname = parsedUrl.pathname;
-  const session = getOrCreateSession(req, res);
-  const currentUser = getUserByLdap(session.userLdap, true) || getUserByLdap('jassouline', true);
+  const clientIp = req.socket.remoteAddress || '127.0.0.1';
+  const authMode = String(process.env.AUTH_MODE || 'demo').trim().toLowerCase();
 
-  // Enforce CSRF token validation on all state-changing (POST) requests
+  // Lightweight container / load-balancer health probe
+  if (req.method === 'GET' && pathname === '/api/healthz') {
+    sendJson(res, 200, {
+      status: 'ok',
+      version: '1.1.0',
+      authMode,
+      dbMode: ACTIVE_DB_PATH === ':memory:' ? 'memory' : 'sqlite-wal',
+    });
+    return;
+  }
+
+  // External M2M Push Ingestion API (/api/v1/ingest) — supports Bearer INGEST_API_TOKEN or Admin Session + CSRF
+  if (req.method === 'POST' && pathname === '/api/v1/ingest') {
+    const isBearerAuth = verifyIngestBearerToken(req);
+    let ingestActorLdap = 'api-connector';
+
+    if (!isBearerAuth) {
+      const session = getOrCreateSession(req, res);
+      if (!validateCsrfToken(req, session)) {
+        sendJson(res, 403, { error: 'Authentification Bearer INGEST_API_TOKEN ou jeton CSRF valide requis.' });
+        return;
+      }
+      const sessionUser = getUserByLdap(session.userLdap, true);
+      if (!sessionUser || sessionUser.role !== 'admin') {
+        sendJson(res, 403, { error: 'Seul un administrateur ou un jeton connecteur peut pousser des données.' });
+        return;
+      }
+      ingestActorLdap = sessionUser.ldap;
+    }
+
+    try {
+      const body = await readJsonBody(req, 131072);
+      const result = ingestExternalData(body, ingestActorLdap, clientIp);
+      sendJson(res, 200, { ingested: result });
+    } catch (err) {
+      sendJson(res, 400, { error: err.message || 'Échec de l’ingestion des données externes.' });
+    }
+    return;
+  }
+
+  // Resolve enterprise user identity:
+  // - In production IAP mode (`AUTH_MODE=iap`), read verified proxy identity header and fail closed if missing/unknown.
+  // - In demo mode (`AUTH_MODE=demo`), use signed HttpOnly session persona.
+  // TODO(security): Verify cryptographic JWT signature (`x-goog-iap-jwt-assertion`) against Google IAP public keys in production.
+  let currentUser = null;
+  let session = null;
+
+  if (authMode === 'iap') {
+    const iapIdentity =
+      req.headers['x-goog-authenticated-user-email'] || req.headers['x-forwarded-user'] || '';
+    currentUser = getUserByIdentity(String(iapIdentity), true);
+    if (!currentUser && pathname.startsWith('/api/')) {
+      sendJson(res, 401, {
+        error: 'Authentification Zero-Trust IAP requise (en-tête X-Goog-Authenticated-User-Email manquant ou utilisateur non habilité).',
+      });
+      return;
+    }
+    session = getOrCreateSession(req, res, currentUser?.ldap || 'jassouline');
+    if (currentUser) {
+      session.userLdap = currentUser.ldap;
+    }
+  } else {
+    session = getOrCreateSession(req, res);
+    currentUser = getUserByLdap(session.userLdap, true) || getUserByLdap('jassouline', true);
+  }
+
+  // Enforce CSRF token validation on all cookie-authenticated state-changing (POST) requests
   if (req.method === 'POST') {
     if (!validateCsrfToken(req, session)) {
       sendJson(res, 403, { error: 'Jeton CSRF manquant ou invalide. Requête bloquée.' });
@@ -323,7 +445,7 @@ export const server = http.createServer(async (req, res) => {
       if (!resolved) {
         sendJson(res, 404, {
           error: `Le raccourci go/${slug} n'existe pas encore.`,
-          suggestion: `Créez-le dans l'onglet go/links du portail Moma-bis.`,
+          suggestion: `Créez-le dans l'onglet go/links du portail WhatsMomat.`,
         });
         return;
       }
@@ -331,14 +453,37 @@ export const server = http.createServer(async (req, res) => {
         sendJson(res, 200, { resolved });
         return;
       }
+
+      let safeTargetUrl = null;
+      try {
+        const parsedTarget = new URL(resolved.target_url);
+        if (parsedTarget.protocol === 'https:' || parsedTarget.protocol === 'http:') {
+          safeTargetUrl = parsedTarget;
+        }
+      } catch {
+        safeTargetUrl = null;
+      }
+
+      const isSimulatedCorpDomain =
+        safeTargetUrl &&
+        (safeTargetUrl.hostname.endsWith('.corp.internal') || safeTargetUrl.hostname.endsWith('.internal'));
+      const shouldExternalRedirect =
+        Boolean(safeTargetUrl) &&
+        (process.env.GO_REDIRECT_MODE === '302' ||
+          parsedUrl.searchParams.get('redirect') === '1' ||
+          !isSimulatedCorpDomain);
+
       res.statusCode = 302;
-      res.setHeader('Location', `/?goResolved=${encodeURIComponent(resolved.slug)}`);
+      if (shouldExternalRedirect) {
+        res.setHeader('Location', safeTargetUrl.toString());
+      } else {
+        res.setHeader('Location', `/?goResolved=${encodeURIComponent(resolved.slug)}`);
+      }
       res.end();
       return;
     }
 
     // 2. Session & Auth Persona API
-    // TODO(security): Integrate OAuth 2.0 / OIDC (Google Workspace / BeyondCorp IAP) and FIDO2 MFA in production.
     if (req.method === 'GET' && pathname === '/api/session') {
       const personas = listAllUsers().map((u) => ({
         ldap: u.ldap,
@@ -351,13 +496,21 @@ export const server = http.createServer(async (req, res) => {
       sendJson(res, 200, {
         csrfToken: session.csrfToken,
         currentUser,
-        personas,
+        personas: authMode === 'iap' ? [] : personas,
+        authMode,
+        dbMode: ACTIVE_DB_PATH === ':memory:' ? 'memory' : 'sqlite-wal',
         geminiConfigured: Boolean(process.env.GEMINI_API_KEY),
       });
       return;
     }
 
     if (req.method === 'POST' && pathname === '/api/auth/switch-persona') {
+      if (authMode === 'iap') {
+        sendJson(res, 403, {
+          error: 'Le changement de persona de démonstration est désactivé lorsque AUTH_MODE=iap.',
+        });
+        return;
+      }
       const body = await readJsonBody(req);
       const targetLdap = String(body.ldap || '').trim().toLowerCase();
       const targetUser = getUserByLdap(targetLdap, true);
@@ -420,6 +573,16 @@ export const server = http.createServer(async (req, res) => {
       if (!orgData) {
         sendJson(res, 404, { error: 'Collaborateur introuvable dans Moma Teams.' });
         return;
+      }
+      if (revealPii && currentUser) {
+        recordAuditLog({
+          actorLdap: currentUser.ldap,
+          action: 'PII_REVEAL',
+          targetType: 'person',
+          targetKey: orgData.profile.ldap,
+          metadata: { department: orgData.profile.department },
+          clientIp,
+        });
       }
       sendJson(res, 200, orgData);
       return;
@@ -530,7 +693,7 @@ export const server = http.createServer(async (req, res) => {
         const updated = actOnApproval(body.approvalKey, body.decision, currentUser);
         sendJson(res, 200, { approval: updated });
       } catch (err) {
-        sendJson(res, 400, { error: err.message || 'Action impossible sur cette demande.' });
+        sendJson(res, err.statusCode || 400, { error: err.message || 'Action impossible sur cette demande.' });
       }
       return;
     }
@@ -566,7 +729,19 @@ export const server = http.createServer(async (req, res) => {
       return;
     }
 
-    // 12. Static Frontend Assets
+    // 12. Security Audit Logs API (Admin & SecOps only)
+    if (req.method === 'GET' && pathname === '/api/audit-logs') {
+      try {
+        const limit = parsedUrl.searchParams.get('limit') || '50';
+        const logs = listAuditLogs(currentUser, limit);
+        sendJson(res, 200, { auditLogs: logs });
+      } catch (err) {
+        sendJson(res, err.statusCode || 403, { error: err.message || 'Accès interdit.' });
+      }
+      return;
+    }
+
+    // 13. Static Frontend Assets
     if (req.method === 'GET') {
       if (pathname === '/' || pathname === '/index.html') {
         serveStaticFile(res, 'index.html', nonce);
@@ -584,12 +759,14 @@ export const server = http.createServer(async (req, res) => {
 
     sendJson(res, 404, { error: 'Route introuvable.' });
   } catch {
-    sendJson(res, 500, { error: 'Une erreur interne est survenue sur le serveur Moma-bis.' });
+    sendJson(res, 500, { error: 'Une erreur interne est survenue sur le serveur WhatsMomat.' });
   }
 });
 
 if (process.argv[1] && path.resolve(process.argv[1]) === __filename) {
   server.listen(PORT, HOST, () => {
-    console.log(`Moma-bis Enterprise Portal listening securely on http://${HOST}:${PORT}`);
+    console.log(
+      `WhatsMomat v1.1 listening securely on http://${HOST}:${PORT} (DB: ${ACTIVE_DB_PATH === ':memory:' ? ':memory:' : path.basename(ACTIVE_DB_PATH)})`
+    );
   });
 }

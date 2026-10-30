@@ -1,11 +1,50 @@
 import { DatabaseSync } from 'node:sqlite';
 import crypto from 'node:crypto';
+import fs from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 // TODO(security): In production deployments with an external RDBMS (e.g., Cloud SQL / AlloyDB),
 // enforce mTLS connections, isolate database schemas per service, and use a least-privilege
 // database user restricted strictly to SELECT/INSERT/UPDATE/DELETE on app tables (never root/admin).
 
-const db = new DatabaseSync(':memory:');
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+const PROJECT_ROOT = path.resolve(__dirname, '..');
+const DATA_DIR = path.resolve(PROJECT_ROOT, 'data');
+
+/**
+ * Resolves the SQLite database path safely:
+ * - Uses ':memory:' when DB_PATH=':memory:' or NODE_ENV='test'.
+ * - Otherwise stores a persistent SQLite database strictly inside the sandboxed ./data/ directory,
+ *   failing closed on any directory traversal attempt.
+ */
+function resolveDatabaseTarget() {
+  const rawEnvPath = String(process.env.DB_PATH || '').trim();
+  if (rawEnvPath === ':memory:' || process.env.NODE_ENV === 'test') {
+    return ':memory:';
+  }
+  fs.mkdirSync(DATA_DIR, { recursive: true, mode: 0o700 });
+  const candidate = !rawEnvPath
+    ? path.resolve(DATA_DIR, 'whatsmomat.sqlite')
+    : !rawEnvPath.includes('/') && !rawEnvPath.includes('\\')
+      ? path.resolve(DATA_DIR, rawEnvPath)
+      : path.resolve(PROJECT_ROOT, rawEnvPath);
+
+  if (!candidate.startsWith(DATA_DIR + path.sep)) {
+    throw new Error('Unsafe database path outside sandboxed ./data/ directory.');
+  }
+  if (!/^[a-zA-Z0-9._-]+\.(sqlite|db)$/.test(path.basename(candidate))) {
+    throw new Error('Invalid database filename; expected <name>.sqlite or <name>.db inside ./data/.');
+  }
+  return candidate;
+}
+
+export const ACTIVE_DB_PATH = resolveDatabaseTarget();
+const db = new DatabaseSync(ACTIVE_DB_PATH);
+if (ACTIVE_DB_PATH !== ':memory:') {
+  db.exec('PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL; PRAGMA foreign_keys = ON;');
+}
 
 /**
  * Validates password strength according to OWASP / NIST guidelines:
@@ -251,9 +290,159 @@ export function initDatabase() {
       go_link TEXT,
       published_at TEXT NOT NULL
     );
+
+    CREATE VIRTUAL TABLE IF NOT EXISTS documents_fts USING fts5(
+      doc_code UNINDEXED,
+      title,
+      summary,
+      content,
+      tags,
+      source_system,
+      category
+    );
+
+    CREATE TABLE IF NOT EXISTS audit_logs (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      actor_ldap TEXT NOT NULL,
+      action TEXT NOT NULL,
+      target_type TEXT NOT NULL,
+      target_key TEXT NOT NULL,
+      metadata_json TEXT NOT NULL DEFAULT '{}',
+      client_ip TEXT NOT NULL DEFAULT '127.0.0.1',
+      created_at TEXT NOT NULL
+    );
   `);
 
   seedInitialData();
+  ensureSupplementalGoLinks();
+  rebuildDocumentsFts();
+}
+
+function ensureSupplementalGoLinks() {
+  const nowIso = '2026-10-28T08:30:00Z';
+  const extras = [
+    {
+      slug: 'menu',
+      target_url: 'https://workplace.corp.internal/microkitchens-and-menus',
+      title: 'Menu du Jour Cafétéria & Micro-Kitchens (Alias go/cafeteria)',
+      description: 'Accès rapide aux menus du jour Paris, Zurich et Londres, options végétariennes et horaires Barista.',
+      category: 'Workplace & Life',
+      owner_ldap: 'marcdu',
+      hits: 4210,
+      is_verified: 1,
+    },
+    {
+      slug: 'jira',
+      target_url: 'https://atlassian.corp.internal/jira/projects',
+      title: 'Atlassian Jira Engineering — Tableaux Sprints & Incidents SRE',
+      description: 'Création et suivi des tickets d’ingénierie, sprints produit et backlogs SRE.',
+      category: 'Engineering & SRE',
+      owner_ldap: 'thomasr',
+      hits: 5310,
+      is_verified: 1,
+    },
+  ];
+  const stmt = db.prepare(`
+    INSERT OR IGNORE INTO go_links (
+      slug, target_url, title, description, category, owner_ldap, hits, is_verified, created_at, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+  for (const g of extras) {
+    stmt.run(
+      g.slug,
+      g.target_url,
+      g.title,
+      g.description,
+      g.category,
+      g.owner_ldap,
+      g.hits,
+      g.is_verified,
+      nowIso,
+      nowIso
+    );
+  }
+}
+
+export function syncDocumentFts(docRow) {
+  if (!docRow || !docRow.doc_code) return;
+  db.prepare('DELETE FROM documents_fts WHERE doc_code = ?').run(docRow.doc_code);
+  db.prepare(`
+    INSERT INTO documents_fts (doc_code, title, summary, content, tags, source_system, category)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+  `).run(
+    docRow.doc_code,
+    docRow.title || '',
+    docRow.summary || '',
+    docRow.content || '',
+    docRow.tags_json || '[]',
+    docRow.source_system || '',
+    docRow.category || ''
+  );
+}
+
+export function rebuildDocumentsFts() {
+  db.exec('DELETE FROM documents_fts;');
+  const docs = db.prepare('SELECT * FROM documents').all();
+  const insertFts = db.prepare(`
+    INSERT INTO documents_fts (doc_code, title, summary, content, tags, source_system, category)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+  `);
+  for (const d of docs) {
+    insertFts.run(
+      d.doc_code,
+      d.title || '',
+      d.summary || '',
+      d.content || '',
+      d.tags_json || '[]',
+      d.source_system || '',
+      d.category || ''
+    );
+  }
+}
+
+export function recordAuditLog({
+  actorLdap = 'anonymous',
+  action,
+  targetType,
+  targetKey,
+  metadata = {},
+  clientIp = '127.0.0.1',
+}) {
+  if (!action || !targetType || !targetKey) return;
+  db.prepare(`
+    INSERT INTO audit_logs (actor_ldap, action, target_type, target_key, metadata_json, client_ip, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+  `).run(
+    String(actorLdap).slice(0, 64),
+    String(action).slice(0, 64),
+    String(targetType).slice(0, 64),
+    String(targetKey).slice(0, 128),
+    JSON.stringify(metadata || {}),
+    String(clientIp || '127.0.0.1').slice(0, 64),
+    new Date().toISOString()
+  );
+}
+
+export function listAuditLogs(currentUser, limit = 50) {
+  if (!currentUser || (currentUser.role !== 'admin' && currentUser.role !== 'security_admin')) {
+    const err = new Error('Accès refusé : journal d’audit réservé aux administrateurs et à SecOps.');
+    err.statusCode = 403;
+    throw err;
+  }
+  const safeLimit = Math.min(Math.max(Number(limit) || 50, 1), 200);
+  const rows = db
+    .prepare('SELECT * FROM audit_logs ORDER BY id DESC LIMIT ?')
+    .all(safeLimit);
+  return rows.map((r) => ({
+    id: r.id,
+    actorLdap: r.actor_ldap,
+    action: r.action,
+    targetType: r.target_type,
+    targetKey: r.target_key,
+    metadata: JSON.parse(r.metadata_json || '{}'),
+    clientIp: r.client_ip,
+    createdAt: r.created_at,
+  }));
 }
 
 function seedInitialData() {
@@ -1575,6 +1764,23 @@ export function getUserByLdap(ldap, revealPii = false) {
   return formatUserProfile(row, revealPii);
 }
 
+/**
+ * Resolves an enterprise user from an IAP / Reverse-Proxy identity header
+ * (e.g. "accounts.google.com:jordan.assouline@corp.internal" or "jassouline").
+ */
+export function getUserByIdentity(rawIdentity, revealPii = false) {
+  if (!rawIdentity || typeof rawIdentity !== 'string') return null;
+  const cleaned = rawIdentity.trim().toLowerCase().replace(/^accounts\.google\.com:/, '');
+  if (!cleaned) return null;
+  if (cleaned.includes('@')) {
+    const byEmail = db.prepare('SELECT * FROM users WHERE LOWER(email) = ? AND active = 1').get(cleaned);
+    if (byEmail) return formatUserProfile(byEmail, revealPii);
+    const localPart = cleaned.split('@')[0].replace(/[^a-z0-9_-]/g, '');
+    return getUserByLdap(localPart, revealPii);
+  }
+  return getUserByLdap(cleaned, revealPii);
+}
+
 export function listAllUsers(searchQuery = '', departmentFilter = '') {
   const q = String(searchQuery || '').trim().toLowerCase();
   const dept = String(departmentFilter || '').trim();
@@ -1734,6 +1940,13 @@ export function toggleConnectorState(connectorKey, currentUser) {
     nextState ? 'Synchronisé à l’instant' : 'Désactivé (Hors index)',
     cleanKey
   );
+  recordAuditLog({
+    actorLdap: currentUser.ldap,
+    action: 'CONNECTOR_TOGGLE',
+    targetType: 'connector',
+    targetKey: cleanKey,
+    metadata: { enabled: Boolean(nextState) },
+  });
   return listConnectors().find((c) => c.connectorKey === cleanKey);
 }
 
@@ -1762,7 +1975,7 @@ export function registerCustomToolConnector(payload, currentUser) {
   const sampleTitle = String(payload.sampleTitle || `Guide & Données temps réel — ${name}`).trim();
   const sampleContent = String(
     payload.sampleContent ||
-      `Outil interne ${name} intégré au moteur fédéré Moma-bis. Accessible via le raccourci go/${rawKey}.`
+      `Outil interne ${name} intégré au moteur fédéré WhatsMomat. Accessible via le raccourci go/${rawKey}.`
   ).trim();
   const oneboxMetricLabel = String(payload.oneboxMetricLabel || 'Statut Intégration Live').trim();
   const oneboxMetricValue = String(
@@ -1857,6 +2070,8 @@ export function registerCustomToolConnector(payload, currentUser) {
     safeDept,
     new Date().toISOString().slice(0, 10)
   );
+  const createdDoc = db.prepare('SELECT * FROM documents WHERE doc_code = ?').get(docCode);
+  syncDocumentFts(createdDoc);
 
   const existingGo = db.prepare('SELECT * FROM go_links WHERE slug = ?').get(rawKey);
   if (!existingGo) {
@@ -1869,34 +2084,308 @@ export function registerCustomToolConnector(payload, currentUser) {
       rawKey,
       parsedUrl.toString(),
       `${name} — Portail Outil Interne`,
-      `Accès direct à l’outil ${name} (${vendor}) intégré dans Moma-bis par @${currentUser.ldap}.`,
+      `Accès direct à l’outil ${name} (${vendor}) intégré dans WhatsMomat par @${currentUser.ldap}.`,
       currentUser.ldap,
       nowIso,
       nowIso
     );
   }
 
+  recordAuditLog({
+    actorLdap: currentUser.ldap,
+    action: 'CONNECTOR_REGISTER',
+    targetType: 'connector',
+    targetKey: rawKey,
+    metadata: { vendor, visibilityDept: safeDept },
+  });
+
   return listConnectors().find((c) => c.connectorKey === rawKey);
+}
+
+/**
+ * External Push / Webhook REST Ingestion API (/api/v1/ingest)
+ * Allows real enterprise IT tools (Jira, ServiceNow, SharePoint, GitLab CI, SAP, Python scripts)
+ * to push ACL-tagged documents, ITSM tickets, and live OneBox metrics into WhatsMomat.
+ */
+export function ingestExternalData(payload, actorLdap = 'system-webhook', clientIp = '127.0.0.1') {
+  const rawConnectorKey = String(payload?.connectorKey || '')
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9-_]+/g, '-');
+  if (!rawConnectorKey || rawConnectorKey.length < 2) {
+    throw new Error('Le champ connectorKey est requis pour l’ingestion (ex: servicenow, sharepoint, custom-crm).');
+  }
+
+  const connectorRow = db.prepare('SELECT * FROM connectors WHERE connector_key = ?').get(rawConnectorKey);
+  if (!connectorRow) {
+    throw new Error(`Connecteur "${rawConnectorKey}" inconnu. Enregistrez-le d’abord dans le Connector Studio.`);
+  }
+
+  const allowedDepts = ['ALL', 'Engineering', 'Security', 'IT Operations', 'People Ops', 'Executive'];
+  const allowedRoles = ['employee', 'hr_manager', 'security_admin', 'admin'];
+  const today = new Date().toISOString().slice(0, 10);
+
+  let upsertedDocs = 0;
+  let upsertedTickets = 0;
+  let updatedOneBox = false;
+
+  if (Array.isArray(payload.documents)) {
+    for (const rawDoc of payload.documents.slice(0, 100)) {
+      const docCode = String(rawDoc.docCode || '')
+        .trim()
+        .toUpperCase()
+        .replace(/[^A-Z0-9-_]/g, '')
+        .slice(0, 36);
+      const title = String(rawDoc.title || '').trim().slice(0, 180);
+      const content = String(rawDoc.content || '').trim().slice(0, 8000);
+      if (!docCode || !title || !content) continue;
+
+      const summary = String(rawDoc.summary || content.slice(0, 180)).trim().slice(0, 280);
+      const sourceSystem = String(rawDoc.sourceSystem || connectorRow.name).trim().slice(0, 90);
+      const category = String(rawDoc.category || connectorRow.category || 'Enterprise Docs').trim().slice(0, 60);
+      const ownerLdap = String(rawDoc.ownerLdap || connectorRow.owner_ldap || actorLdap)
+        .trim()
+        .toLowerCase()
+        .replace(/[^a-z0-9_-]/g, '') || 'jassouline';
+      const goLink = rawDoc.goLink ? String(rawDoc.goLink).trim().slice(0, 60) : null;
+      const tagsArr = Array.isArray(rawDoc.tags)
+        ? rawDoc.tags.map((t) => String(t).trim().toLowerCase()).filter(Boolean).slice(0, 15)
+        : [rawConnectorKey];
+      const safeDept = allowedDepts.includes(rawDoc.visibilityDept)
+        ? rawDoc.visibilityDept
+        : connectorRow.visibility_dept || 'ALL';
+      const safeMinRole = allowedRoles.includes(rawDoc.minRole) ? rawDoc.minRole : 'employee';
+
+      const existingDoc = db.prepare('SELECT id FROM documents WHERE doc_code = ?').get(docCode);
+      if (existingDoc) {
+        db.prepare(`
+          UPDATE documents
+          SET connector_key = ?, title = ?, summary = ?, content = ?, source_system = ?,
+              category = ?, owner_ldap = ?, go_link = ?, tags_json = ?, visibility_dept = ?, min_role = ?, updated_at = ?
+          WHERE doc_code = ?
+        `).run(
+          rawConnectorKey,
+          title,
+          summary,
+          content,
+          sourceSystem,
+          category,
+          ownerLdap,
+          goLink,
+          JSON.stringify(tagsArr),
+          safeDept,
+          safeMinRole,
+          today,
+          docCode
+        );
+      } else {
+        db.prepare(`
+          INSERT INTO documents (
+            doc_code, connector_key, title, summary, content, source_system, category,
+            owner_ldap, go_link, tags_json, visibility_dept, min_role, updated_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `).run(
+          docCode,
+          rawConnectorKey,
+          title,
+          summary,
+          content,
+          sourceSystem,
+          category,
+          ownerLdap,
+          goLink,
+          JSON.stringify(tagsArr),
+          safeDept,
+          safeMinRole,
+          today
+        );
+      }
+      const savedDoc = db.prepare('SELECT * FROM documents WHERE doc_code = ?').get(docCode);
+      syncDocumentFts(savedDoc);
+      upsertedDocs += 1;
+    }
+  }
+
+  if (Array.isArray(payload.tickets)) {
+    for (const rawTicket of payload.tickets.slice(0, 100)) {
+      const ticketKey = String(rawTicket.ticketKey || '')
+        .trim()
+        .toUpperCase()
+        .replace(/[^A-Z0-9-_]/g, '')
+        .slice(0, 32);
+      const title = String(rawTicket.title || '').trim().slice(0, 160);
+      if (!ticketKey || !title) continue;
+      const status = String(rawTicket.status || 'Ouvert').trim().slice(0, 48);
+      const priority = String(rawTicket.priority || 'P2 - Normale').trim().slice(0, 32);
+      const systemName = String(rawTicket.systemName || connectorRow.name).trim().slice(0, 80);
+      const requesterLdap = String(rawTicket.requesterLdap || actorLdap).trim().toLowerCase().slice(0, 32);
+      const assigneeLdap = String(rawTicket.assigneeLdap || connectorRow.owner_ldap).trim().toLowerCase().slice(0, 32);
+      const summary = String(rawTicket.summary || title).trim().slice(0, 350);
+
+      const existingTicket = db.prepare('SELECT id FROM tickets WHERE ticket_key = ?').get(ticketKey);
+      if (existingTicket) {
+        db.prepare(`
+          UPDATE tickets
+          SET connector_key = ?, title = ?, status = ?, priority = ?, system_name = ?,
+              requester_ldap = ?, assignee_ldap = ?, summary = ?, updated_at = ?
+          WHERE ticket_key = ?
+        `).run(
+          rawConnectorKey,
+          title,
+          status,
+          priority,
+          systemName,
+          requesterLdap,
+          assigneeLdap,
+          summary,
+          today,
+          ticketKey
+        );
+      } else {
+        db.prepare(`
+          INSERT INTO tickets (
+            ticket_key, connector_key, title, status, priority, system_name,
+            requester_ldap, assignee_ldap, summary, updated_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `).run(
+          ticketKey,
+          rawConnectorKey,
+          title,
+          status,
+          priority,
+          systemName,
+          requesterLdap,
+          assigneeLdap,
+          summary,
+          today
+        );
+      }
+      upsertedTickets += 1;
+    }
+  }
+
+  if (payload.oneboxCard && typeof payload.oneboxCard === 'object') {
+    const ob = payload.oneboxCard;
+    const cardTitle = String(ob.cardTitle || `OneBox ${connectorRow.name}`).trim().slice(0, 140);
+    const cardSubtitle = String(ob.cardSubtitle || `Synchronisé via API /api/v1/ingest (${today})`).trim().slice(0, 180);
+    const badgeText = String(ob.badgeText || `${connectorRow.vendor} Live`).trim().slice(0, 48);
+    const triggerKeywords = String(ob.triggerKeywords || connectorRow.onebox_trigger || rawConnectorKey)
+      .trim()
+      .toLowerCase()
+      .slice(0, 200);
+    const fields = Array.isArray(ob.fields)
+      ? ob.fields
+          .slice(0, 6)
+          .map((f) => ({
+            label: String(f.label || '').trim().slice(0, 60),
+            value: String(f.value || '').trim().slice(0, 160),
+          }))
+          .filter((f) => f.label && f.value)
+      : [];
+    const actionLabel = String(ob.actionLabel || `Ouvrir go/${rawConnectorKey}`).trim().slice(0, 60);
+    const actionGoLink = String(ob.actionGoLink || `go/${rawConnectorKey}`).trim().slice(0, 60);
+    const safeDept = allowedDepts.includes(ob.visibilityDept)
+      ? ob.visibilityDept
+      : connectorRow.visibility_dept || 'ALL';
+
+    if (fields.length > 0) {
+      const existingOb = db.prepare('SELECT id FROM onebox_cards WHERE connector_key = ?').get(rawConnectorKey);
+      if (existingOb) {
+        db.prepare(`
+          UPDATE onebox_cards
+          SET trigger_keywords = ?, card_title = ?, card_subtitle = ?, badge_text = ?,
+              fields_json = ?, action_label = ?, action_go_link = ?, visibility_dept = ?
+          WHERE id = ?
+        `).run(
+          triggerKeywords,
+          cardTitle,
+          cardSubtitle,
+          badgeText,
+          JSON.stringify(fields),
+          actionLabel,
+          actionGoLink,
+          safeDept,
+          existingOb.id
+        );
+      } else {
+        db.prepare(`
+          INSERT INTO onebox_cards (
+            connector_key, trigger_keywords, card_title, card_subtitle, badge_text,
+            fields_json, action_label, action_go_link, visibility_dept
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `).run(
+          rawConnectorKey,
+          triggerKeywords,
+          cardTitle,
+          cardSubtitle,
+          badgeText,
+          JSON.stringify(fields),
+          actionLabel,
+          actionGoLink,
+          safeDept
+        );
+      }
+      updatedOneBox = true;
+    }
+  }
+
+  db.prepare('UPDATE connectors SET last_sync_at = ? WHERE connector_key = ?').run(
+    `Ingéré via API (${new Date().toISOString().slice(11, 19)} UTC)`,
+    rawConnectorKey
+  );
+
+  recordAuditLog({
+    actorLdap,
+    action: 'CONNECTOR_INGEST',
+    targetType: 'connector',
+    targetKey: rawConnectorKey,
+    metadata: { upsertedDocs, upsertedTickets, updatedOneBox },
+    clientIp,
+  });
+
+  return {
+    connectorKey: rawConnectorKey,
+    upsertedDocs,
+    upsertedTickets,
+    updatedOneBox,
+  };
 }
 
 /**
  * Whatis Acronym Glossary APIs
  */
-export function listAcronyms(searchQuery = '') {
+export function listAcronyms(searchQuery = '', categoryFilter = '') {
   const q = String(searchQuery || '')
     .trim()
     .toLowerCase()
     .replace(/^(whatis|define)[:\s]+/i, '');
+  const cat = String(categoryFilter || '').trim();
+  const hasCat = Boolean(cat && cat.toUpperCase() !== 'ALL');
+
   let rows;
-  if (!q) {
-    rows = db.prepare('SELECT * FROM acronyms ORDER BY upvotes DESC, term ASC').all();
-  } else {
+  if (q && hasCat) {
+    const like = `%${q}%`;
+    rows = db.prepare(`
+      SELECT * FROM acronyms
+      WHERE category = ?
+        AND (LOWER(term) LIKE ? OR LOWER(expansion) LIKE ? OR LOWER(definition) LIKE ?)
+      ORDER BY upvotes DESC, term ASC
+    `).all(cat, like, like, like);
+  } else if (q) {
     const like = `%${q}%`;
     rows = db.prepare(`
       SELECT * FROM acronyms
       WHERE LOWER(term) LIKE ? OR LOWER(expansion) LIKE ? OR LOWER(definition) LIKE ?
       ORDER BY upvotes DESC, term ASC
     `).all(like, like, like);
+  } else if (hasCat) {
+    rows = db.prepare(`
+      SELECT * FROM acronyms
+      WHERE category = ?
+      ORDER BY upvotes DESC, term ASC
+    `).all(cat);
+  } else {
+    rows = db.prepare('SELECT * FROM acronyms ORDER BY upvotes DESC, term ASC').all();
   }
   return rows.map((a) => ({
     ...a,
@@ -1970,15 +2459,30 @@ export function actOnApproval(approvalKey, decision, currentUser) {
   if (!existing) {
     throw new Error('Demande d’approbation introuvable.');
   }
+  if (existing.approver_ldap !== currentUser.ldap && currentUser.role !== 'admin') {
+    const forbiddenErr = new Error(
+      `Accès refusé : seule la personne désignée (@${existing.approver_ldap}) ou un administrateur peut traiter la demande ${cleanKey}.`
+    );
+    forbiddenErr.statusCode = 403;
+    throw forbiddenErr;
+  }
   const normDecision = String(decision || '').trim().toLowerCase();
   const nextStatus = normDecision.startsWith('approv') ? 'approved' : 'rejected';
   db.prepare('UPDATE approvals SET status = ? WHERE approval_key = ?').run(nextStatus, cleanKey);
+  recordAuditLog({
+    actorLdap: currentUser.ldap,
+    action: 'APPROVAL_DECISION',
+    targetType: 'approval',
+    targetKey: cleanKey,
+    metadata: { decision: nextStatus.toUpperCase(), requesterLdap: existing.requester_ldap },
+  });
   const updated = db.prepare('SELECT * FROM approvals WHERE approval_key = ?').get(cleanKey);
   return {
     ...updated,
     source_system: updated.source_tool,
     amount_or_impact: updated.amount_or_scope,
     status: String(updated.status || '').toUpperCase(),
+    can_act: true,
   };
 }
 
@@ -2247,6 +2751,14 @@ export function createOrUpdateGoLink({ slug, targetUrl, title, description, cate
     `).run(cleanSlug, parsedUrl.toString(), cleanTitle, cleanDesc, safeCategory, currentUser.ldap, nowIso, nowIso);
   }
 
+  recordAuditLog({
+    actorLdap: currentUser.ldap,
+    action: existing ? 'GOLINK_UPDATE' : 'GOLINK_CREATE',
+    targetType: 'golink',
+    targetKey: cleanSlug,
+    metadata: { targetUrl: parsedUrl.toString(), category: safeCategory },
+  });
+
   return db.prepare('SELECT * FROM go_links WHERE slug = ?').get(cleanSlug);
 }
 
@@ -2266,6 +2778,13 @@ export function deleteGoLink(slug, currentUser) {
     throw new Error(`Suppression refusée : seul @${existing.owner_ldap} ou un administrateur peut supprimer go/${cleanSlug}.`);
   }
   db.prepare('DELETE FROM go_links WHERE slug = ?').run(cleanSlug);
+  recordAuditLog({
+    actorLdap: currentUser.ldap,
+    action: 'GOLINK_DELETE',
+    targetType: 'golink',
+    targetKey: cleanSlug,
+    metadata: { previousOwner: existing.owner_ldap },
+  });
   return { deleted: cleanSlug };
 }
 
@@ -2433,7 +2952,29 @@ export function executeFederatedSearch(rawQuery, currentUser, facet = 'all') {
     }
   }
 
-  // 1. Search Documents with Connector status check + Operator filters + strict ACL trimming
+  // 1. Search Documents with SQLite FTS5 BM25 ranking + Connector status check + Operator filters + strict ACL trimming
+  const ftsScoreByDocCode = new Map();
+  if (tokens.length > 0) {
+    const ftsTokens = tokens
+      .map((t) => t.replace(/[^\p{L}\p{N}]/gu, ''))
+      .filter((t) => t.length >= 2);
+    if (ftsTokens.length > 0) {
+      const ftsMatchExpr = ftsTokens.map((t) => `"${t}"*`).join(' OR ');
+      try {
+        const ftsRows = db
+          .prepare('SELECT doc_code, bm25(documents_fts) AS rank FROM documents_fts WHERE documents_fts MATCH ?')
+          .all(ftsMatchExpr);
+        for (const r of ftsRows) {
+          // SQLite bm25() returns negative scores where lower (more negative) is more relevant
+          const boost = Math.max(4, Math.round(Math.abs(Number(r.rank) || 1) * 10));
+          ftsScoreByDocCode.set(r.doc_code, boost);
+        }
+      } catch {
+        // Fallback smoothly if FTS expression encounters an edge-case token
+      }
+    }
+  }
+
   const allDocs = db.prepare('SELECT * FROM documents ORDER BY updated_at DESC').all();
   let aclFilteredOutCount = 0;
   let disabledConnectorSkippedCount = 0;
@@ -2450,6 +2991,9 @@ export function executeFederatedSearch(rawQuery, currentUser, facet = 'all') {
     } else if (!query) {
       score = 1;
     } else {
+      if (ftsScoreByDocCode.has(doc.doc_code)) {
+        score += ftsScoreByDocCode.get(doc.doc_code);
+      }
       if (haystack.includes(normalized)) score += 10;
       for (const tok of tokens) {
         if (doc.title.toLowerCase().includes(tok)) score += 5;
@@ -2630,36 +3174,47 @@ export function getDashboardWidgets(currentUser) {
     }));
 
   // Personalized "My Moma" Widgets:
-  // 1. Pending Approvals for current user (or all pending if Executive/Admin)
+  // 1. Pending Approvals filtered strictly to current user (approver or requester) or Platform/Exec Admin
+  const userLdap = currentUser?.ldap || '';
+  const isAdmin = currentUser?.role === 'admin';
   const pendingApprovals = db
     .prepare('SELECT * FROM approvals ORDER BY id ASC')
     .all()
-    .filter((ap) => enabledKeys.has(ap.connector_key))
+    .filter(
+      (ap) =>
+        enabledKeys.has(ap.connector_key) &&
+        (isAdmin || ap.approver_ldap === userLdap || ap.requester_ldap === userLdap)
+    )
     .map((ap) => ({
       ...ap,
       source_system: ap.source_tool,
       amount_or_impact: ap.amount_or_scope,
       summary: `${ap.title} (${ap.amount_or_scope})`,
       status: String(ap.status || 'pending').toUpperCase(),
+      can_act: isAdmin || ap.approver_ldap === userLdap,
     }));
 
-  // 2. Daily Meetings
+  // 2. Daily Meetings filtered to meetings owned by or involving current user
   const rawMeetings = db.prepare('SELECT * FROM meetings ORDER BY id ASC').all();
-  const meetings = rawMeetings.map((m) => {
-    const [startTime = '', endTime = ''] = String(m.time_slot || '').split(' - ');
-    return {
-      id: m.id,
-      timeSlot: m.time_slot,
-      start_time: startTime,
-      end_time: endTime,
-      title: m.title,
-      roomAndFloor: m.room_and_floor,
-      room: m.room_and_floor,
-      meetGoLink: m.meet_go_link,
-      video_link: m.meet_go_link,
-      attendees: JSON.parse(m.attendees_json || '[]'),
-    };
-  });
+  const meetings = rawMeetings
+    .map((m) => {
+      const [startTime = '', endTime = ''] = String(m.time_slot || '').split(' - ');
+      const attendees = JSON.parse(m.attendees_json || '[]');
+      return {
+        id: m.id,
+        ownerLdap: m.owner_ldap,
+        timeSlot: m.time_slot,
+        start_time: startTime,
+        end_time: endTime,
+        title: m.title,
+        roomAndFloor: m.room_and_floor,
+        room: m.room_and_floor,
+        meetGoLink: m.meet_go_link,
+        video_link: m.meet_go_link,
+        attendees,
+      };
+    })
+    .filter((m) => !userLdap || m.ownerLdap === userLdap || m.attendees.includes(userLdap));
 
   // 3. Campus Cafeteria Menu matching current user's office city
   let campusKey = 'Paris';

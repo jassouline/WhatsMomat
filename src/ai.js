@@ -1,8 +1,10 @@
 /**
- * Moma-bis AI Overview & Enterprise RAG Synthesis Engine
- * Uses @google/genai (Interactions API) with `gemini-3.8-flash` when GEMINI_API_KEY is set,
+ * WhatsMomat AI Overview & Multi-Turn Enterprise RAG Synthesis Engine
+ * Uses @google/genai (Interactions API) with `gemini-3.7-flash` (or GEMINI_MODEL) when GEMINI_API_KEY is set,
  * and provides a deterministic grounded RAG synthesis fallback when running offline.
  */
+
+const DEFAULT_GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-3.7-flash';
 
 export async function generateMomaAiOverview(query, searchResults, currentUser) {
   const cleanQuery = String(query || '').trim();
@@ -35,7 +37,8 @@ export async function generateMomaAiOverview(query, searchResults, currentUser) 
   if (!cleanQuery) {
     return {
       mode: 'idle',
-      model: 'gemini-3.8-flash',
+      model: DEFAULT_GEMINI_MODEL,
+      interactionId: null,
       answer: '',
       bullets: [],
       citations: [],
@@ -44,7 +47,7 @@ export async function generateMomaAiOverview(query, searchResults, currentUser) 
     };
   }
 
-  // If GEMINI_API_KEY is configured in environment, call Gemini 3.8 Flash via @google/genai Interactions API
+  // If GEMINI_API_KEY is configured in environment, call Gemini via @google/genai Interactions API
   const apiKey = process.env.GEMINI_API_KEY;
   if (apiKey) {
     try {
@@ -75,21 +78,22 @@ export async function generateMomaAiOverview(query, searchResults, currentUser) 
         })),
       });
 
+      // Keep server-side state enabled (default store=true) so Ask Moma follow-ups can chain previous_interaction_id
       const interaction = await client.interactions.create({
-        model: 'gemini-3.8-flash',
+        model: DEFAULT_GEMINI_MODEL,
         system_instruction:
           'Tu es Moma AI, l’assistant de recherche interne d’entreprise (inspiré de Google Moma). ' +
           'Réponds en français de manière concise, précise et professionnelle en te basant UNIQUEMENT sur le contexte autorisé (ACL) fourni. ' +
           'Mentionne systématiquement les raccourcis internes go/ pertinents et les références [1], [2].',
         input: `Question collaborateur : "${cleanQuery}"\n\nContexte interne autorisé (ACL vérifiées) :\n${groundingContext}`,
-        store: false,
       });
 
       const outputText = interaction.output_text || '';
       if (outputText) {
         return {
           mode: 'gemini-live',
-          model: 'gemini-3.8-flash (Interactions API)',
+          model: `${DEFAULT_GEMINI_MODEL} (Interactions API)`,
+          interactionId: interaction.id || null,
           answer: outputText,
           bullets: buildActionableBullets(topDocs, topGoLinks, topTickets),
           citations,
@@ -116,7 +120,8 @@ export async function generateMomaAiOverview(query, searchResults, currentUser) 
   if (topDocs.length === 0 && topGoLinks.length === 0 && topPeople.length === 0 && topTickets.length === 0) {
     return {
       mode: 'grounded-rag',
-      model: 'gemini-3.8-flash (Grounded Enterprise RAG)',
+      model: `${DEFAULT_GEMINI_MODEL} (Grounded Enterprise RAG)`,
+      interactionId: null,
       answer:
         searchResults.aclTrimmedCount > 0
           ? `Aucun document ouvert ne correspond à « ${cleanQuery} » pour votre profil (@${currentUser.ldap}), mais ${searchResults.aclTrimmedCount} document(s) confidentiel(s) ont été masqués par le contrôle d’accès (ACL Trimming). Essayez de basculer sur le profil Security Admin ou Executive pour vérifier les droits.`
@@ -156,7 +161,8 @@ export async function generateMomaAiOverview(query, searchResults, currentUser) 
 
   return {
     mode: 'grounded-rag',
-    model: 'gemini-3.8-flash (Grounded Enterprise RAG)',
+    model: `${DEFAULT_GEMINI_MODEL} (Grounded Enterprise RAG)`,
+    interactionId: null,
     answer: synthesizedAnswer,
     bullets: buildActionableBullets(topDocs, topGoLinks, topTickets),
     citations,
@@ -196,8 +202,8 @@ function buildActionableBullets(topDocs, topGoLinks, topTickets) {
 
 /**
  * Multi-Turn Conversational "Ask Moma" follow-up handler.
- * Uses @google/genai Interactions API (`previous_interaction_id`) with `gemini-3.8-flash`
- * when GEMINI_API_KEY is present, and a grounded ACL-safe RAG response otherwise.
+ * Uses @google/genai Interactions API (`previous_interaction_id`) when GEMINI_API_KEY is present,
+ * and a grounded ACL-safe RAG response otherwise.
  */
 export async function askMomaFollowUp({ question, previousInteractionId, queryContext, currentUser, searchResults }) {
   const cleanQuestion = String(question || '').trim();
@@ -217,10 +223,11 @@ export async function askMomaFollowUp({ question, previousInteractionId, queryCo
       const { GoogleGenAI } = await import('@google/genai');
       const client = new GoogleGenAI({ apiKey });
 
+      // Per Interactions API specification, system_instruction is interaction-scoped and re-specified each turn
       const requestPayload = {
-        model: 'gemini-3.8-flash',
+        model: DEFAULT_GEMINI_MODEL,
         system_instruction:
-          'Tu es Ask Moma, l’assistant conversationnel multi-tour de l’intranet Moma-bis. ' +
+          'Tu es Ask Moma, l’assistant conversationnel multi-tour de l’intranet WhatsMomat. ' +
           'Réponds en français de façon directe, sourcée et sécurisée selon les ACLs de l’utilisateur.',
         input:
           `Question de suivi de @${currentUser.ldap} (${currentUser.department}) : "${cleanQuestion}"\n` +
@@ -229,7 +236,7 @@ export async function askMomaFollowUp({ question, previousInteractionId, queryCo
           `Liens go/ : ${JSON.stringify(topGoLinks.map((g) => ({ slug: `go/${g.slug}`, title: g.title })))}\n` +
           `Acronymes Whatis : ${JSON.stringify(topAcronyms)}`,
       };
-      if (previousInteractionId) {
+      if (previousInteractionId && !String(previousInteractionId).startsWith('local-turn-')) {
         requestPayload.previous_interaction_id = String(previousInteractionId);
       }
 
@@ -237,7 +244,7 @@ export async function askMomaFollowUp({ question, previousInteractionId, queryCo
       if (interaction && interaction.output_text) {
         return {
           mode: 'gemini-live',
-          model: 'gemini-3.8-flash',
+          model: DEFAULT_GEMINI_MODEL,
           interactionId: interaction.id || null,
           question: cleanQuestion,
           answer: interaction.output_text,
@@ -275,7 +282,8 @@ export async function askMomaFollowUp({ question, previousInteractionId, queryCo
   } else if (qLower.includes('ticket') || qLower.includes('incident') || qLower.includes('demande') || qLower.includes('approuver') || qLower.includes('action')) {
     if (topTickets.length > 0) {
       const t = topTickets[0];
-      answer = `Le ticket associé est ${t.ticket_key} (« ${t.title} ») sur ${t.source_system}, actuellement au statut ${t.status} (priorité ${t.priority}). Vous pouvez aussi ouvrir un nouveau ticket directement depuis le bouton « + Créer un ticket IT » ci-dessous.`;
+      const sysName = t.system_name || t.source_system || 'ServiceNow ITSM';
+      answer = `Le ticket associé est ${t.ticket_key} (« ${t.title} ») sur ${sysName}, actuellement au statut ${t.status} (priorité ${t.priority}). Vous pouvez aussi ouvrir un nouveau ticket directement depuis le bouton « + Créer un ticket IT » ci-dessous.`;
     } else {
       answer = `Vous pouvez déclencher un ticket ServiceNow / Jira directement depuis Moma en cliquant sur « + Créer un ticket IT » ou valider vos demandes en attente dans le centre d’approbations.`;
     }
@@ -291,7 +299,7 @@ export async function askMomaFollowUp({ question, previousInteractionId, queryCo
 
   return {
     mode: 'grounded-rag',
-    model: 'gemini-3.8-flash (Multi-Turn RAG)',
+    model: `${DEFAULT_GEMINI_MODEL} (Multi-Turn RAG)`,
     interactionId: `local-turn-${Date.now()}`,
     question: cleanQuestion,
     answer,
@@ -331,4 +339,3 @@ function buildSuggestedAction(question, topDocs, topGoLinks, topTickets) {
   }
   return null;
 }
-

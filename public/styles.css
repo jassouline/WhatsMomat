@@ -1216,6 +1216,10 @@ body {
   gap: 0.5rem;
 }
 
+.btn-submit-spaced {
+  margin-top: 0.5rem;
+}
+
 @media (max-width: 980px) {
   .dashboard-grid, .federated-results-grid, .teams-layout, .golinks-layout {
     grid-template-columns: 1fr;

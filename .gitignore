@@ -1,8 +1,12 @@
 node_modules/
+data/
 .env
 .env.*
+!.env.example
 .session_secret
 *.sqlite
 *.sqlite-journal
+*.sqlite-wal
+*.sqlite-shm
 *.db
 .DS_Store

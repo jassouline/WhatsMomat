@@ -7,6 +7,7 @@
 const appState = {
   csrfToken: null,
   currentUser: null,
+  authMode: 'demo',
   personas: [],
   activeView: 'home',
   activeQuery: '',
@@ -30,7 +31,7 @@ function el(tag, options = {}, children = []) {
   }
   if (options.attrs) {
     for (const [k, v] of Object.entries(options.attrs)) {
-      if (v !== undefined && v !== null) {
+      if (v !== undefined && v !== null && k.toLowerCase() !== 'style') {
         node.setAttribute(k, String(v));
       }
     }
@@ -195,6 +196,18 @@ function renderHeaderUser() {
   );
 
   select.replaceChildren();
+  if (appState.authMode === 'iap') {
+    select.disabled = true;
+    select.appendChild(
+      el('option', {
+        text: `SSO / IAP Zero-Trust : @${appState.currentUser.ldap}`,
+        attrs: { value: appState.currentUser.ldap },
+      })
+    );
+    return;
+  }
+
+  select.disabled = false;
   for (const p of appState.personas) {
     const opt = el('option', {
       text: `${p.fullName} — ${p.department} (${p.role})`,
@@ -272,12 +285,41 @@ async function loadDashboard() {
     approvalsList.replaceChildren();
     for (const a of data.approvals || []) {
       const isPending = a.status === 'PENDING';
+      const canAct = a.can_act !== false;
       const statusBadgeClass =
         a.status === 'APPROVED'
           ? 'badge badge-green'
           : a.status === 'REJECTED'
             ? 'badge badge-red'
             : 'badge badge-amber';
+
+      let actionNode;
+      if (isPending && canAct) {
+        actionNode = el('div', { className: 'approval-actions' }, [
+          el('button', {
+            className: 'btn-approve',
+            text: '✓ Approuver en 1 clic',
+            attrs: { type: 'button' },
+            onClick: () => handleApprovalDecision(a.approval_key, 'APPROVED'),
+          }),
+          el('button', {
+            className: 'btn-reject',
+            text: '✕ Refuser',
+            attrs: { type: 'button' },
+            onClick: () => handleApprovalDecision(a.approval_key, 'REJECTED'),
+          }),
+        ]);
+      } else if (isPending) {
+        actionNode = el('span', {
+          text: `En attente de @${a.approver_ldap}`,
+          style: { fontWeight: '600', color: '#b45309' },
+        });
+      } else {
+        actionNode = el('span', {
+          text: `Traité (${a.status}) le ${a.created_at}`,
+          style: { fontWeight: '600', color: '#0f766e' },
+        });
+      }
 
       const card = el('div', { className: 'doc-item' }, [
         el('div', { className: 'doc-item-header' }, [
@@ -291,25 +333,7 @@ async function loadDashboard() {
         el('div', { className: 'doc-meta' }, [
           el('span', { text: `Demandeur : @${a.requester_ldap}` }),
           el('span', { text: `Impact / Montant : ${a.amount_or_impact}` }),
-          isPending
-            ? el('div', { className: 'approval-actions' }, [
-                el('button', {
-                  className: 'btn-approve',
-                  text: '✓ Approuver en 1 clic',
-                  attrs: { type: 'button' },
-                  onClick: () => handleApprovalDecision(a.approval_key, 'APPROVED'),
-                }),
-                el('button', {
-                  className: 'btn-reject',
-                  text: '✕ Refuser',
-                  attrs: { type: 'button' },
-                  onClick: () => handleApprovalDecision(a.approval_key, 'REJECTED'),
-                }),
-              ])
-            : el('span', {
-                text: `Traité (${a.status}) le ${a.created_at}`,
-                style: { fontWeight: '600', color: '#0f766e' },
-              }),
+          actionNode,
         ]),
       ]);
       approvalsList.appendChild(card);
@@ -628,6 +652,9 @@ async function runFederatedSearch(query, facet = 'all') {
     `/api/search?q=${encodeURIComponent(cleanQ)}&facet=${encodeURIComponent(facet)}`
   );
   appState.lastSearchPayload = data;
+  if (isNewQuery && data.aiOverview && data.aiOverview.interactionId) {
+    appState.lastInteractionId = data.aiOverview.interactionId;
+  }
   renderSearchResults(data);
 }
 
@@ -1771,9 +1798,9 @@ function openQuickTicketModal(defaultTitle = '') {
     el('label', { className: 'form-label', text: 'Description & justification' }),
     summaryInput,
     el('button', {
-      className: 'btn-primary btn-full',
+      className: 'btn-primary btn-full btn-submit-spaced',
       text: 'Créer le ticket directement depuis Moma',
-      attrs: { type: 'submit', style: 'margin-top: 0.5rem' },
+      attrs: { type: 'submit' },
     }),
   ]);
 
@@ -1887,6 +1914,7 @@ async function bootstrapMomaApp() {
     const sessionData = await apiFetch('/api/session');
     appState.csrfToken = sessionData.csrfToken;
     appState.currentUser = sessionData.currentUser;
+    appState.authMode = sessionData.authMode || 'demo';
     appState.personas = sessionData.personas || [];
 
     renderHeaderUser();

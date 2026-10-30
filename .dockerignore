@@ -1,0 +1,13 @@
+node_modules
+data
+.git
+.gitignore
+.env
+.env.*
+.session_secret
+*.sqlite
+*.sqlite-journal
+*.sqlite-wal
+*.sqlite-shm
+*.db
+.DS_Store
